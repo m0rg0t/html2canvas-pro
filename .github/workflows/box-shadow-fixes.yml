@@ -47,6 +47,7 @@ jobs:
             tmp/box-shadow-regressions/
             src/render/canvas/box-shadow-painter.ts
             src/render/canvas/canvas-renderer.ts
+            src/render/canvas/__tests__/box-shadow-painter.test.ts
             scripts/box-shadow-regressions.mjs
             dist/html2canvas-pro.esm.js
   validation:
@@ -63,11 +64,15 @@ jobs:
       - run: corepack enable && corepack prepare pnpm@10.9.0 --activate
       - run: pnpm install --frozen-lockfile --ignore-scripts
       - run: pnpm build
-      - name: Unit tests
+      - name: Unit tests including shadow lifecycle
         run: pnpm unittest
-      - name: Lint
+      - name: Full source lint (quoted glob includes nested renderer files)
         if: always()
-        run: pnpm lint
+        run: |
+          mkdir -p tmp/format-review
+          pnpm exec prettier src/render/canvas/box-shadow-painter.ts > tmp/format-review/box-shadow-painter.ts
+          pnpm exec prettier src/render/canvas/__tests__/box-shadow-painter.test.ts > tmp/format-review/box-shadow-painter.test.ts
+          pnpm exec eslint 'src/**/*.ts' --max-warnings 0
       - name: Install browser engines
         if: always()
         run: pnpm exec playwright install --with-deps chromium firefox webkit
