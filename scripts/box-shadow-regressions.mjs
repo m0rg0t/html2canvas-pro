@@ -226,10 +226,20 @@ try {
                             return canvas.toDataURL();
                         }, { scale, region: test.crop });
                         const actual = decode(await capture());
-                        const neutralizer = await page.addStyleTag({ content: '.box { box-shadow:none !important }' });
+                        // Firefox's addStyleTag observes unrelated delayed CSP image
+                        // errors. Change the fixture inline instead; do not suppress
+                        // page errors or weaken the native/capture comparisons.
+                        const originalStyle = await page.locator('.box').evaluate((element) => {
+                            const style = element.getAttribute('style');
+                            element.style.setProperty('box-shadow', 'none', 'important');
+                            return style;
+                        });
                         const nativeControl = await nativeDOM(page, stage, name, key + '-native-no-shadow', test.crop, scale);
                         const actualControl = decode(await capture());
-                        await neutralizer.evaluate((element) => element.remove());
+                        await page.locator('.box').evaluate((element, style) => {
+                            if (style === null) element.removeAttribute('style');
+                            else element.setAttribute('style', style);
+                        }, originalStyle);
                         const { diff, ...metrics } = measure(native, actual, nativeControl, actualControl);
                         entry.metrics = metrics;
                         entry.errors = violations(metrics, test.id === 'none');

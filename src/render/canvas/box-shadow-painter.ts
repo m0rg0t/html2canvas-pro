@@ -61,12 +61,7 @@ const paintShadowSurface = async (
               2 * spread,
               2 * spread
           );
-    const bounds = cropSurface(
-        area.add(-margin, -margin, 2 * margin, 2 * margin),
-        space.viewport,
-        margin,
-        space.scale
-    );
+    const bounds = cropSurface(area.add(-margin, -margin, 2 * margin, 2 * margin), space.viewport, margin, space.scale);
     if (!bounds.width || !bounds.height) return true;
     const width = Math.ceil(bounds.width * space.scale);
     const height = Math.ceil(bounds.height * space.scale);
@@ -172,6 +167,25 @@ export const paintBoxShadow = async (
             );
             ctx.fillStyle = asString(shadow.color);
             ctx.fill('evenodd');
+            return;
+        }
+        if (!shadow.inset && shadow.blur.number === 0) {
+            // A hard shadow is just a translated silhouette. Painting it directly
+            // avoids the browser's device-space Canvas shadow raster rounding.
+            complement(ctx, viewport, calculateBorderBoxPath(paint.curves));
+            ctx.clip('evenodd');
+            createCanvasPath(
+                ctx,
+                transformPath(
+                    spreadShadowPath(calculateBorderBoxPath(paint.curves), spread),
+                    shadow.offsetX.number,
+                    shadow.offsetY.number,
+                    0,
+                    0
+                )
+            );
+            ctx.fillStyle = asString(shadow.color);
+            ctx.fill();
             return;
         }
         const margin =

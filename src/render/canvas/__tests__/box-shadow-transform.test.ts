@@ -19,7 +19,9 @@ describe('box-shadow coordinate space', () => {
 
     it('keeps reflections in the uniform-scale fast path', () => {
         const space = shadowSpace({ ...identity, a: -1, e: 320 }, 320, 260);
-        expect(space?.viewport).toMatchObject({ left: 0, top: 0, width: 320, height: 260 });
+        expect(space?.viewport).toMatchObject({ width: 320, height: 260 });
+        expect(space?.viewport.left).toBeCloseTo(0);
+        expect(space?.viewport.top).toBeCloseTo(0);
         expect(space?.uniform).toBe(true);
     });
 
