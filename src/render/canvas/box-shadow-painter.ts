@@ -111,7 +111,8 @@ export const paintBoxShadow = async (
 ): Promise<void> => {
     if (options.signal?.aborted) throw new DOMException('The operation was aborted.', 'AbortError');
     if (isTransparent(shadow.color)) return;
-    if (shadow.inset && shadow.blur.number > 0 && (await paintInsetSurface(ctx, paint, shadow, options, budget))) return;
+    if (shadow.inset && shadow.blur.number > 0 && (await paintInsetSurface(ctx, paint, shadow, options, budget)))
+        return;
     const spread = shadow.spread.number;
     if (
         !shadow.inset &&
@@ -152,10 +153,8 @@ export const paintBoxShadow = async (
         } else {
             complement(ctx, viewport, calculateBorderBoxPath(paint.curves));
             ctx.clip('evenodd');
-            createCanvasPath(
-                ctx,
-                transformPath(spreadShadowPath(calculateBorderBoxPath(paint.curves), spread), -displacement, 0, 0, 0)
-            );
+            const path = spreadShadowPath(calculateBorderBoxPath(paint.curves), spread);
+            createCanvasPath(ctx, transformPath(path, -displacement, 0, 0, 0));
         }
         // Canvas shadow metrics are in output pixels, not transformed CSS pixels.
         // The displaced source must be moved back by the scaled displacement too.
