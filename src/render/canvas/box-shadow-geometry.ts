@@ -4,8 +4,10 @@ import { Vector } from '../vector';
 
 // CSS Backgrounds 3, 6.1.1: growing a small corner needs the cubic adjustment
 // to approach a square continuously as the original radius approaches zero.
-export const shadowRadius = (radius: number, spread: number): number =>
-    Math.max(0, radius + (spread > radius ? spread * (1 + Math.pow(radius / spread - 1, 3)) : spread));
+export const shadowRadius = (radius: number, spread: number): number => {
+    const delta = spread > radius ? spread * (1 + Math.pow(radius / spread - 1, 3)) : spread;
+    return Math.max(0, radius + delta);
+};
 
 // Input is the four clockwise border/padding corner segments from BoundCurves.
 // Translation alone preserves the old radii and turns a spread circle into a
@@ -24,7 +26,7 @@ export const spreadShadowPath = (paths: Path[], spread: number): Path[] => {
     const width = corners[1].x - corners[0].x + 2 * spread;
     const height = corners[3].y - corners[0].y + 2 * spread;
     if (width <= 0 || height <= 0) return [];
-    const radii = corners.map(({ rx, ry }) => ({ x: shadowRadius(rx, spread), y: shadowRadius(ry, spread) }));
+    const radii = corners.map((c) => ({ x: shadowRadius(c.rx, spread), y: shadowRadius(c.ry, spread) }));
     const ratio = (size: number, sum: number): number => (sum > 0 ? size / sum : 1);
     const factor = Math.min(
         1,
@@ -41,8 +43,14 @@ export const spreadShadowPath = (paths: Path[], spread: number): Path[] => {
         const rx = radii[index].x * factor;
         const ry = radii[index].y * factor;
         if (!rx || !ry) return new Vector(x, y);
-        const resize = (v: Vector): Vector =>
-            new Vector(x + ((v.x - corner.x) * rx) / corner.rx, y + ((v.y - corner.y) * ry) / corner.ry);
-        return new BezierCurve(resize(point.start), resize(point.startControl), resize(point.endControl), resize(point.end));
+        const sx = rx / corner.rx;
+        const sy = ry / corner.ry;
+        const resize = (v: Vector): Vector => new Vector(x + (v.x - corner.x) * sx, y + (v.y - corner.y) * sy);
+        return new BezierCurve(
+            resize(point.start),
+            resize(point.startControl),
+            resize(point.endControl),
+            resize(point.end)
+        );
     });
 };
