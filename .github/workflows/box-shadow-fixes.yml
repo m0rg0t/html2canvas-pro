@@ -1,0 +1,85 @@
+name: Box-shadow fixes validation
+
+on:
+  push:
+    branches: [box-shadow-rendering-fixes]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pixels:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        browser: [chromium, firefox, webkit]
+    env:
+      SKIP_PREPARE: 'true'
+      PUPPETEER_SKIP_DOWNLOAD: 'true'
+      BOX_SHADOW_BROWSERS: ${{ matrix.browser }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 20
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: corepack enable && corepack prepare pnpm@10.9.0 --activate
+      - run: pnpm install --frozen-lockfile --ignore-scripts
+      - run: pnpm build
+      - run: pnpm exec playwright install --with-deps ${{ matrix.browser }}
+      - name: Original box-shadow acceptance suite
+        run: node scripts/box-shadow-regressions.mjs
+      - name: Source diff
+        if: always()
+        run: |
+          mkdir -p tmp/box-shadow-regressions
+          git diff d01f7ce8b75e945c47bb71d7c83cc5a42cbc1555 HEAD -- src/ > tmp/box-shadow-regressions/production.patch
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: box-shadow-fixed-${{ matrix.browser }}
+          retention-days: 14
+          path: |
+            tmp/box-shadow-regressions/
+            src/render/canvas/box-shadow-painter.ts
+            src/render/canvas/canvas-renderer.ts
+            scripts/box-shadow-regressions.mjs
+            dist/html2canvas-pro.esm.js
+  validation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      SKIP_PREPARE: 'true'
+      PUPPETEER_SKIP_DOWNLOAD: 'true'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: corepack enable && corepack prepare pnpm@10.9.0 --activate
+      - run: pnpm install --frozen-lockfile --ignore-scripts
+      - run: pnpm build
+      - name: Unit tests
+        run: pnpm unittest
+      - name: Lint
+        if: always()
+        run: pnpm lint
+      - name: Install browser engines
+        if: always()
+        run: pnpm exec playwright install --with-deps chromium firefox webkit
+      - name: Existing filter and compositing regressions
+        if: always()
+        run: |
+          node scripts/filter-descriptor-regressions.mjs
+          node scripts/filter-native-regressions.mjs
+          node scripts/filter-surface-regressions.mjs
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: box-shadow-existing-regressions
+          retention-days: 14
+          path: tmp/
