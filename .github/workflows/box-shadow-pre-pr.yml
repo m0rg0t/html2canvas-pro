@@ -48,7 +48,7 @@ jobs:
       - run: pnpm build
       - run: pnpm exec playwright install --with-deps ${{ matrix.browser }}
       - run: node scripts/box-shadow-regressions.mjs
-      - run: node scripts/box-shadow-extended-regressions.mjs
+      - run: node scripts/box-shadow-extended-regressions.mjs\n      - if: matrix.browser == 'chromium'\n        run: node scripts/box-shadow-issue-230.mjs
       - if: always()
         uses: actions/upload-artifact@v4
         with:
