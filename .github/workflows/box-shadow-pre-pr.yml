@@ -3,7 +3,7 @@ name: Box-shadow pre-PR
 on:
   push:
     branches: [box-shadow-rendering-clean]
-  pull_request:\n    branches: [main]\n  workflow_dispatch:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -48,7 +48,9 @@ jobs:
       - run: pnpm build
       - run: pnpm exec playwright install --with-deps ${{ matrix.browser }}
       - run: node scripts/box-shadow-regressions.mjs
-      - run: node scripts/box-shadow-extended-regressions.mjs\n      - if: matrix.browser == 'chromium'\n        run: node scripts/box-shadow-issue-230.mjs
+      - run: node scripts/box-shadow-extended-regressions.mjs
+      - if: matrix.browser == 'chromium'
+        run: node scripts/box-shadow-issue-230.mjs
       - if: always()
         uses: actions/upload-artifact@v4
         with:
