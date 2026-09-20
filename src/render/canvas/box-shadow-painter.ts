@@ -9,6 +9,7 @@ import { Path, transformPath } from '../path';
 import { createCanvasPath, formatCanvasPath } from './canvas-path';
 import { FilterSurfaceError, releaseSurface, renderFilterSurface } from './filter-surface';
 import { cropSurface, reserveSurface, SurfaceBudget } from './surface-bounds';
+import { spreadShadowPath } from './box-shadow-geometry';
 
 interface ShadowOptions {
     x: number;
@@ -34,13 +35,7 @@ const insetHole = (paint: ElementPaint, shadow: BoxShadow[number], dx = 0): Path
     const spread = shadow.spread.number;
     const box = paddingBox(paint.container);
     if (box.width - 2 * spread <= 0 || box.height - 2 * spread <= 0) return [];
-    return transformPath(
-        calculatePaddingBoxPath(paint.curves),
-        spread + dx,
-        spread,
-        -2 * spread,
-        -2 * spread
-    );
+    return transformPath(spreadShadowPath(calculatePaddingBoxPath(paint.curves), -spread), dx, 0, 0, 0);
 };
 
 // An inset shadow is the blurred opaque exterior of a translated hole, clipped
@@ -86,7 +81,13 @@ const paintInsetSurface = async (
         try {
             createCanvasPath(ctx, calculatePaddingBoxPath(paint.curves));
             ctx.clip();
-            ctx.drawImage(filtered, bounds.left, bounds.top, filtered.width / options.scale, filtered.height / options.scale);
+            ctx.drawImage(
+                filtered,
+                bounds.left,
+                bounds.top,
+                filtered.width / options.scale,
+                filtered.height / options.scale
+            );
         } finally {
             ctx.restore();
         }
@@ -112,7 +113,11 @@ export const paintBoxShadow = async (
     if (isTransparent(shadow.color)) return;
     if (shadow.inset && shadow.blur.number > 0 && (await paintInsetSurface(ctx, paint, shadow, options, budget))) return;
     const spread = shadow.spread.number;
-    if (!shadow.inset && (paint.container.bounds.width + 2 * spread <= 0 || paint.container.bounds.height + 2 * spread <= 0)) return;
+    if (
+        !shadow.inset &&
+        (paint.container.bounds.width + 2 * spread <= 0 || paint.container.bounds.height + 2 * spread <= 0)
+    )
+        return;
     const viewport = new Bounds(options.x, options.y, options.width, options.height);
     const padding = paddingBox(paint.container);
     ctx.save();
@@ -120,12 +125,22 @@ export const paintBoxShadow = async (
         if (shadow.inset && shadow.blur.number === 0) {
             createCanvasPath(ctx, calculatePaddingBoxPath(paint.curves));
             ctx.clip();
-            complement(ctx, padding, transformPath(insetHole(paint, shadow), shadow.offsetX.number, shadow.offsetY.number, 0, 0));
+            complement(
+                ctx,
+                padding,
+                transformPath(insetHole(paint, shadow), shadow.offsetX.number, shadow.offsetY.number, 0, 0)
+            );
             ctx.fillStyle = asString(shadow.color);
             ctx.fill('evenodd');
             return;
         }
-        const margin = Math.ceil(shadow.blur.number * 2 + Math.abs(spread) + Math.abs(shadow.offsetX.number) + Math.abs(shadow.offsetY.number)) + 2;
+        const margin =
+            Math.ceil(
+                shadow.blur.number * 2 +
+                    Math.abs(spread) +
+                    Math.abs(shadow.offsetX.number) +
+                    Math.abs(shadow.offsetY.number)
+            ) + 2;
         const displacement = Math.max(SHADOW_MASK_OFFSET, options.width + margin * 2 + paint.container.bounds.width);
         if (shadow.inset) {
             // Allocation/CSP fallback: retain a bounded-memory native path. The
@@ -137,7 +152,10 @@ export const paintBoxShadow = async (
         } else {
             complement(ctx, viewport, calculateBorderBoxPath(paint.curves));
             ctx.clip('evenodd');
-            createCanvasPath(ctx, transformPath(calculateBorderBoxPath(paint.curves), -displacement - spread, -spread, 2 * spread, 2 * spread));
+            createCanvasPath(
+                ctx,
+                transformPath(spreadShadowPath(calculateBorderBoxPath(paint.curves), spread), -displacement, 0, 0, 0)
+            );
         }
         // Canvas shadow metrics are in output pixels, not transformed CSS pixels.
         // The displaced source must be moved back by the scaled displacement too.
