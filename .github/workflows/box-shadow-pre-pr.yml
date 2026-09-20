@@ -1,0 +1,58 @@
+name: Box-shadow pre-PR
+
+on:
+  push:
+    branches: [box-shadow-rendering-clean]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      SKIP_PREPARE: 'true'
+      PUPPETEER_SKIP_DOWNLOAD: 'true'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: corepack enable && corepack prepare pnpm@10.9.0 --activate
+      - run: pnpm install --frozen-lockfile --ignore-scripts
+      - run: pnpm build
+      - run: pnpm unittest
+      - run: pnpm exec eslint 'src/**/*.ts' --max-warnings 0
+
+  pixels:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        browser: [chromium, firefox, webkit]
+    env:
+      SKIP_PREPARE: 'true'
+      PUPPETEER_SKIP_DOWNLOAD: 'true'
+      PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
+      BOX_SHADOW_BROWSERS: ${{ matrix.browser }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: corepack enable && corepack prepare pnpm@10.9.0 --activate
+      - run: pnpm install --frozen-lockfile --ignore-scripts
+      - run: pnpm build
+      - run: pnpm exec playwright install --with-deps ${{ matrix.browser }}
+      - run: node scripts/box-shadow-regressions.mjs
+      - run: node scripts/box-shadow-extended-regressions.mjs
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: box-shadow-pre-pr-${{ matrix.browser }}
+          path: |
+            tmp/box-shadow-regressions/
+            tmp/box-shadow-extended/
