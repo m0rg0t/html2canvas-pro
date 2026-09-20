@@ -79,6 +79,41 @@ const server = http.createServer((req, res) => {
 await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
 const origin = `http://127.0.0.1:${server.address().port}`;
 const decode = (data) => PNG.sync.read(Buffer.from(data.split(',')[1], 'base64'));
+async function nativeDOM(page, stage, name, prefix, region, scale) {
+    if (name !== 'firefox') return crop(PNG.sync.read(await stage.screenshot({ omitBackground: true })), region, scale);
+    // Playwright Firefox cannot omit the screenshot background. These fixtures
+    // use source-over only: black = RGB * alpha; white - black = 255 * (1-alpha).
+    // Reconstruct premultiplied transparency from two independently captured
+    // opaque backgrounds, keeping both originals as evidence. No library output
+    // participates in the reconstruction.
+    const previous = await page.evaluate(() => document.documentElement.getAttribute('style'));
+    let white, black;
+    try {
+        await page.evaluate(() => document.documentElement.style.setProperty('background', 'white', 'important'));
+        white = crop(PNG.sync.read(await stage.screenshot()), region, scale);
+        await page.evaluate(() => document.documentElement.style.setProperty('background', 'black', 'important'));
+        black = crop(PNG.sync.read(await stage.screenshot()), region, scale);
+    } finally {
+        await page.evaluate((value) => {
+            if (value === null) document.documentElement.removeAttribute('style');
+            else document.documentElement.setAttribute('style', value);
+        }, previous);
+    }
+    assert.equal(white.width, black.width);
+    assert.equal(white.height, black.height);
+    const result = new PNG({ width: white.width, height: white.height });
+    for (let i = 0; i < result.data.length; i += 4) {
+        const differences = [0, 1, 2].map((c) => white.data[i + c] - black.data[i + c]);
+        assert.ok(Math.max(...differences) - Math.min(...differences) <= 3,
+            'Native reference does not satisfy source-over background reconstruction');
+        const alpha = Math.max(0, Math.min(255, Math.round(255 - differences.reduce((sum, v) => sum + v, 0) / 3)));
+        result.data[i + 3] = alpha;
+        for (let c = 0; c < 3; c++) result.data[i + c] = alpha ? Math.min(255, Math.round(black.data[i + c] * 255 / alpha)) : 0;
+    }
+    await writeFile(path.join(output, `${prefix}-white.png`), PNG.sync.write(white));
+    await writeFile(path.join(output, `${prefix}-black.png`), PNG.sync.write(black));
+    return result;
+}
 function vector(data, i) {
     const a = data[i + 3] / 255;
     return [data[i] * a, data[i + 1] * a, data[i + 2] * a, data[i + 3]];
@@ -144,7 +179,7 @@ async function report() {
 <style>body{font:15px system-ui;margin:28px;max-width:1400px}table{border-collapse:collapse}td,th{padding:6px;border:1px solid #bbb;text-align:left}img{max-width:30%;background:repeating-conic-gradient(#ddd 0% 25%,#fff 0% 50%) 50%/16px 16px}details{margin:20px 0}.fail{color:#b00020}</style>
 <h1>Box-shadow: native DOM vs html2canvas-pro</h1><p>${summary.passed} passed; ${summary.failed} failed. No expected failures are suppressed.</p>
 <p>Commit: <code>${escape(gitRevision)}</code><br>Bundle SHA256: <code>${metadata.bundleSHA256}</code></p>
-<p>Each image triplet is native DOM / library / amplified pixel difference. Transparent PNGs use a checkerboard. Thresholds apply to the union of native and rendered shadow regions, not empty margins.</p>
+<p>Each image triplet is native DOM / library / amplified pixel difference. Transparent PNGs use a checkerboard. Firefox transparency is reconstructed from native white/black screenshots, which are also saved. Thresholds apply to the union of native and rendered shadow regions, not empty margins.</p>
 <pre>${escape(JSON.stringify(metadata, null, 2))}</pre>
 ${results.map((r) => `<details ${r.passed ? '' : 'open'}><summary class="${r.passed ? '' : 'fail'}">${escape(r.key)}: ${r.passed ? 'PASS' : 'FAIL'}</summary><pre>${escape(JSON.stringify(r, null, 2))}</pre>${r.images ? ['native', 'actual', 'diff'].map((kind) => `<a href="${r.key}-${kind}.png"><img alt="${kind}" src="${r.key}-${kind}.png"></a>`).join(' ') : ''}</details>`).join('\n')}`);
 }
@@ -157,7 +192,7 @@ try {
             for (const scale of [1, 2]) {
                 for (const test of cases) {
                     const key = `${name}-${scale}x-${test.id}`;
-                    const entry = { key, browser: name, scale, id: test.id, backend: test.svg ? 'forced-svg' : 'auto', passed: false };
+                    const entry = { key, browser: name, scale, id: test.id, backend: test.svg ? 'forced-svg' : 'auto', referenceMethod: name === 'firefox' ? 'dual-background-alpha' : 'transparent-screenshot', passed: false };
                     const page = await browser.newPage({ viewport: { width: 500, height: 420 }, deviceScaleFactor: scale });
                     const pageErrors = [];
                     page.on('pageerror', (error) => pageErrors.push(error.message));
@@ -175,7 +210,7 @@ try {
                             boxShadow: getComputedStyle(element).boxShadow,
                             borderRadius: getComputedStyle(element).borderRadius
                         }));
-                        const native = crop(PNG.sync.read(await stage.screenshot({ omitBackground: true })), test.crop, scale);
+                        const native = await nativeDOM(page, stage, name, key + '-native', test.crop, scale);
                         const capture = async () => page.evaluate(async ({ scale, region }) => {
                             const canvas = await window.renderer(document.getElementById('stage'), {
                                 scale, backgroundColor: null, logging: false, ...(region || {})
@@ -184,7 +219,7 @@ try {
                         }, { scale, region: test.crop });
                         const actual = decode(await capture());
                         const neutralizer = await page.addStyleTag({ content: '.box { box-shadow:none !important }' });
-                        const nativeControl = crop(PNG.sync.read(await stage.screenshot({ omitBackground: true })), test.crop, scale);
+                        const nativeControl = await nativeDOM(page, stage, name, key + '-native-no-shadow', test.crop, scale);
                         const actualControl = decode(await capture());
                         await neutralizer.evaluate((element) => element.remove());
                         const { diff, ...metrics } = measure(native, actual, nativeControl, actualControl);
