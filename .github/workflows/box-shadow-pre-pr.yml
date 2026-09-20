@@ -3,7 +3,7 @@ name: Box-shadow pre-PR
 on:
   push:
     branches: [box-shadow-rendering-clean]
-  workflow_dispatch:
+  pull_request:\n    branches: [main]\n  workflow_dispatch:
 
 permissions:
   contents: read
