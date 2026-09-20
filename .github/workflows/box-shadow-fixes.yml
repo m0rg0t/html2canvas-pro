@@ -23,7 +23,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 20
+          fetch-depth: 30
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
@@ -33,6 +33,9 @@ jobs:
       - run: pnpm exec playwright install --with-deps ${{ matrix.browser }}
       - name: Original box-shadow acceptance suite
         run: node scripts/box-shadow-regressions.mjs
+      - name: Extended shadow geometry and inset cases
+        if: always()
+        run: node scripts/box-shadow-extended-regressions.mjs
       - name: Source diff
         if: always()
         run: |
@@ -45,10 +48,14 @@ jobs:
           retention-days: 14
           path: |
             tmp/box-shadow-regressions/
+            tmp/box-shadow-extended/
             src/render/canvas/box-shadow-painter.ts
+            src/render/canvas/box-shadow-geometry.ts
             src/render/canvas/canvas-renderer.ts
             src/render/canvas/__tests__/box-shadow-painter.test.ts
+            src/render/canvas/__tests__/box-shadow-geometry.test.ts
             scripts/box-shadow-regressions.mjs
+            scripts/box-shadow-extended-regressions.mjs
             dist/html2canvas-pro.esm.js
   validation:
     runs-on: ubuntu-latest
@@ -64,14 +71,18 @@ jobs:
       - run: corepack enable && corepack prepare pnpm@10.9.0 --activate
       - run: pnpm install --frozen-lockfile --ignore-scripts
       - run: pnpm build
-      - name: Unit tests including shadow lifecycle
-        run: pnpm unittest
+      - name: Unit tests including shadow lifecycle and geometry
+        run: |
+          mkdir -p tmp
+          pnpm exec vitest run --reporter=json --outputFile=tmp/unit-tests.json
       - name: Full source lint (quoted glob includes nested renderer files)
         if: always()
         run: |
           mkdir -p tmp/format-review
           pnpm exec prettier src/render/canvas/box-shadow-painter.ts > tmp/format-review/box-shadow-painter.ts
+          pnpm exec prettier src/render/canvas/box-shadow-geometry.ts > tmp/format-review/box-shadow-geometry.ts
           pnpm exec prettier src/render/canvas/__tests__/box-shadow-painter.test.ts > tmp/format-review/box-shadow-painter.test.ts
+          pnpm exec prettier src/render/canvas/__tests__/box-shadow-geometry.test.ts > tmp/format-review/box-shadow-geometry.test.ts
           pnpm exec eslint 'src/**/*.ts' --max-warnings 0
       - name: Install browser engines
         if: always()
