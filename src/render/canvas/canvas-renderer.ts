@@ -571,7 +571,7 @@ export class CanvasRenderer {
 
         let side = 0;
         for (const border of borders) {
-            if (border.style !== BORDER_STYLE.NONE && !isTransparent(border.color)) {
+            if (border.style !== BORDER_STYLE.NONE && !isTransparent(border.color) && border.width > 0) {
                 const renderBorderSide = async (): Promise<void> => {
                     if (border.style === BORDER_STYLE.DASHED) {
                         await this.borderRenderer.renderDashedDottedBorder(
