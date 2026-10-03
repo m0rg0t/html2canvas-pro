@@ -10,17 +10,23 @@ on:
 
 jobs:
     build:
+        permissions:
+            contents: read
+        env:
+            npm_config_audit: false
+            SKIP_PREPARE: true
+            PUPPETEER_SKIP_DOWNLOAD: true
         runs-on: ubuntu-latest
         name: Build
         steps:
-            - uses: actions/checkout@v5
+            - uses: actions/checkout@v7
             - uses: pnpm/action-setup@v6
-            - uses: actions/setup-node@v5
+            - uses: actions/setup-node@v7
               with:
                   node-version: 24
                   cache: 'pnpm'
             - name: Install dependencies
-              run: pnpm install --frozen-lockfile
+              run: pnpm install --frozen-lockfile --ignore-scripts --config.audit=false
             - name: Build
               run: pnpm build
             - name: Check bundle size
@@ -69,43 +75,57 @@ jobs:
                   mv html2canvas-*.tgz html2canvas-pro.tgz
                   tar --list --verbose --file=html2canvas-pro.tgz
             - name: Upload npm pack
-              uses: actions/upload-artifact@v6
+              uses: actions/upload-artifact@v7
               with:
                   name: pnpm-package
                   path: html2canvas-pro.tgz
                   if-no-files-found: error
             - name: Upload dist
-              uses: actions/upload-artifact@v6
+              uses: actions/upload-artifact@v7
               with:
                   name: dist
                   path: dist
                   if-no-files-found: error
             - name: Upload build
-              uses: actions/upload-artifact@v6
+              uses: actions/upload-artifact@v7
               with:
                   name: build
                   path: build
                   if-no-files-found: error
 
     test:
+        permissions:
+            contents: read
+        env:
+            npm_config_audit: false
+            SKIP_PREPARE: true
+            PUPPETEER_SKIP_DOWNLOAD: true
         runs-on: ubuntu-latest
         name: Test
         steps:
-            - uses: actions/checkout@v5
+            - uses: actions/checkout@v7
             - uses: pnpm/action-setup@v6
-            - uses: actions/setup-node@v5
+            - uses: actions/setup-node@v7
               with:
                   node-version: 24
                   cache: 'pnpm'
             - name: Install dependencies
-              run: pnpm install --frozen-lockfile
+              run: pnpm install --frozen-lockfile --ignore-scripts --config.audit=false
             - name: Build
               run: pnpm build
             - name: Lint
               run: pnpm lint
+            - name: Production typecheck
+              run: pnpm typecheck
+            - name: Contributor command regression tests
+              run: pnpm test:tooling
+            - name: Documentation build
+              run: pnpm docs:build
             - name: Unit tests
               run: pnpm unittest:coverage
     browser-test:
+        permissions:
+            contents: read
         strategy:
             fail-fast: false
             matrix:
@@ -125,23 +145,26 @@ jobs:
         name: ${{ matrix.config.name }}
         env:
             TARGET_BROWSER: ${{ matrix.config.targetBrowser }}
+            npm_config_audit: false
+            SKIP_PREPARE: true
+            PUPPETEER_SKIP_DOWNLOAD: true
         needs: build
         steps:
-            - uses: actions/checkout@v5
+            - uses: actions/checkout@v7
             - uses: pnpm/action-setup@v6
-            - uses: actions/setup-node@v5
+            - uses: actions/setup-node@v7
               with:
                   node-version: 24
                   cache: 'pnpm'
             - name: Install dependencies
-              run: pnpm install --frozen-lockfile
+              run: pnpm install --frozen-lockfile --ignore-scripts --config.audit=false
             - name: Download library
-              uses: actions/download-artifact@v7
+              uses: actions/download-artifact@v8
               with:
                   name: dist
                   path: dist
             - name: Download test-runner
-              uses: actions/download-artifact@v7
+              uses: actions/download-artifact@v8
               with:
                   name: build
                   path: build
@@ -160,7 +183,7 @@ jobs:
               if: ${{ matrix.config.xvfb == true }}
               run: DISPLAY=:99 pnpm karma
             - name: Upload screenshots
-              uses: actions/upload-artifact@v6
+              uses: actions/upload-artifact@v7
               with:
                   name: reftest-results-${{ matrix.config.targetBrowser }}
                   path: tmp/reftests

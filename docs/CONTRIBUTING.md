@@ -2,11 +2,14 @@
 
 ## Quick Start
 
+Contributors use Node 24 LTS and the exact pnpm version in `packageManager` (currently 10.34.6). `.nvmrc` selects Node 24. These build-tool requirements are separate from the published library's existing Node/browser-consumer contract. Do not use an audit command as part of install or CI.
+
 ```bash
-pnpm install
+pnpm install --frozen-lockfile
 pnpm build       # TypeScript compile + Rolldown bundle
-pnpm test        # Run all unit tests (vitest)
-pnpm typecheck   # TypeScript type check only
+pnpm unittest    # Run unit tests (Vitest)
+pnpm typecheck   # No-emit check of published production source
+pnpm test:tooling # Validate contributor commands and CI wiring
 ```
 
 ## Adding a New CSS Property
@@ -101,9 +104,12 @@ Update `docs/features.md` to list the newly supported property.
 ### Running Tests
 
 ```bash
-pnpm test             # Run all tests
-pnpm test -- --watch  # Watch mode
-pnpm test path/to/file # Run specific test file
+pnpm unittest                    # Run unit tests
+pnpm watch:unittest               # Watch unit tests
+pnpm unittest path/to/file        # Run a specific unit test file
+pnpm unittest:coverage           # Unit tests with the existing coverage thresholds
+pnpm test                        # Lint, unit tests and Karma browser tests
+pnpm docs:build                  # Build the documentation
 ```
 
 ### Test Structure
@@ -134,7 +140,9 @@ Rolldown → CJS bundle (dist/html2canvas-pro.cjs)
 ```
 
 - `pnpm build` — full build (tsc + rolldown)
-- `pnpm typecheck` — TypeScript check only
+- `pnpm typecheck` — no-emit check using `tsconfig.build.json`, covering the published production source. Unit-test fixtures are exercised by Vitest; their pre-existing type errors are not covered by this production-source command.
+- `pnpm lint` — recursive, read-only lint including nested tests; the quoted glob works without shell `globstar`.
+- `pnpm test:tooling` — dependency-free regression checks for these commands.
 - Git hooks (Husky) run prettier + eslint on staged files
 
 ## Release Process
@@ -149,3 +157,11 @@ This bumps the version, runs the build, and publishes to npm.
 
 See [ARCHITECTURE.md](./ARCHITECTURE.md) for a detailed walkthrough of the rendering pipeline,
 key design patterns, and file size reference.
+
+## Compatibility holds
+
+Vitest and its V8 coverage provider remain paired on current 3.2.x. The tested Vitest 5 migration changed branch instrumentation from 76.66% to 48.81% with all 1,171 tests still passing; the existing 70% gate is preserved pending a dedicated coverage migration. pnpm stays on current 10.x to retain the existing lockfile/install family. TypeScript remains on 5.9 while the existing declaration/CommonJS compilation pipeline is retained; TypeScript 6/7 requires a separate module-resolution migration, and TypeScript 7 is outside the current typescript-eslint/TypeDoc peer ranges. VitePress remains on stable 1.x. Native iOS simulator and release-tool major versions remain in their established compatible families; this PR does not certify a new simulator platform or run release tooling. Node types follow the contributor Node 24 runtime. Runtime dependencies, renderer behavior, browser targets, bundle entry points and package version are unchanged.
+
+CI retains Chrome, Firefox and native Safari tests. The fork-specific Native WKWebView workflow remains separate and unchanged; a Safari pass is not a WKWebView result. No upstream commits or already-merged upstream renderer PRs are replayed.
+
+See [maintenance compatibility notes](./MAINTENANCE.md) for verified holds and remaining development advisories.
