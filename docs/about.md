@@ -34,4 +34,4 @@ The library works on all modern evergreen browsers (Chrome, Firefox, Safari, Edg
 - Safari 10.1+
 - Edge (latest)
 
-**Node.js:** Requires Node.js >=16.0.0 for development and build tooling.
+**Node.js:** The published package declares `engines.node >= 24`; development, CI and the test suite also use **Node.js 24** (jsdom 30 requires it). pnpm is pinned via the `packageManager` field and picked up by Corepack.

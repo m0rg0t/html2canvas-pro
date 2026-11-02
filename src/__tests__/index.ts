@@ -96,4 +96,41 @@ describe('html2canvas', () => {
         );
         expect(DocumentCloner.destroy).not.toBeCalled();
     });
+
+    it('should propagate a mount rejection (cleanup is owned by the mount itself)', async () => {
+        // The mount removes its own iframe when it rejects (load watchdog /
+        // abort), because renderElement never receives the reference. This
+        // test only pins the rejection reaching the caller; the removal is
+        // verified by the mount-failure tests in iframe-mount.test.ts.
+        const mock = await import('../dom/document-cloner');
+        const original = mock.DocumentCloner.prototype.toIFrame;
+        mock.DocumentCloner.prototype.toIFrame = vi
+            .fn()
+            .mockRejectedValue(new Error('Cloned iframe did not fire its load event'));
+
+        try {
+            await expect(html2canvas(element)).rejects.toThrow('did not fire its load event');
+        } finally {
+            mock.DocumentCloner.prototype.toIFrame = original;
+        }
+    });
+
+    it('should emit onProgress milestones through the pipeline', async () => {
+        const onProgress = vi.fn();
+        await html2canvas(element, { onProgress });
+
+        expect(onProgress).toHaveBeenCalled();
+        const events = onProgress.mock.calls as Array<[string, number]>;
+        expect(events.map(([phase]) => phase)).toEqual(['clone', 'clone', 'parse', 'layout', 'render', 'render']);
+        const progresses = events.map(([, progress]) => progress);
+        expect(progresses).toEqual([10, 30, 50, 60, 90, 100]);
+    });
+
+    it('should survive a throwing onProgress callback', async () => {
+        const onProgress = vi.fn(() => {
+            throw new Error('consumer bug');
+        });
+        await html2canvas(element, { onProgress });
+        expect(onProgress).toHaveBeenCalled();
+    });
 });

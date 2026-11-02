@@ -1,4 +1,5 @@
 import { ElementContainer } from '../dom/element-container';
+import { at } from '../core/util';
 import { contains } from '../core/bitwise';
 import { BoundCurves, calculateBorderBoxPath, calculatePaddingBoxPath } from './bound-curves';
 import {
@@ -8,7 +9,10 @@ import {
     EffectTarget,
     FilterEffect,
     IElementEffect,
+    isBlendEffect,
     isClipEffect,
+    isFilterEffect,
+    isOpacityEffect,
     OpacityEffect,
     TransformEffect
 } from './effects';
@@ -51,6 +55,8 @@ export class ElementPaint {
     readonly effects: IElementEffect[] = [];
     readonly curves: BoundCurves;
     listValue?: string;
+    /** Memoised getEffects results for the plain (surfaceRoot-less) render path. */
+    private plainEffectsCache: Map<EffectTarget, IElementEffect[]> | null = null;
 
     constructor(
         readonly container: ElementContainer,
@@ -59,6 +65,21 @@ export class ElementPaint {
         this.curves = new BoundCurves(this.container);
         if (this.container.styles.opacity < 1) {
             this.effects.push(new OpacityEffect(this.container.styles.opacity));
+        }
+
+        // CSS Transforms Level 2 combines the individual transform properties
+        // with `transform` as translate → rotate → scale → transform, all
+        // around the shared transform-origin. Effects are applied in push
+        // order and post-multiply, so pushing in this order yields the spec
+        // matrix product T·R·S·X.
+        if (this.container.styles.translate !== null) {
+            const origin = this.container.styles.transformOrigin;
+            const offsetX = this.container.bounds.left + getAbsoluteValue(origin[0], this.container.bounds.width);
+            const offsetY = this.container.bounds.top + getAbsoluteValue(origin[1], this.container.bounds.height);
+            const [tx, ty] = this.container.styles.translate;
+            const dx = getAbsoluteValue(tx, this.container.bounds.width);
+            const dy = getAbsoluteValue(ty, this.container.bounds.height);
+            this.effects.push(new TransformEffect(offsetX, offsetY, [1, 0, 0, 1, dx, dy]));
         }
 
         if (this.container.styles.rotate !== null) {
@@ -72,6 +93,14 @@ export class ElementPaint {
             const sin = Math.sin(rad);
             const rotateMatrix: Matrix = [cos, sin, -sin, cos, 0, 0];
             this.effects.push(new TransformEffect(offsetX, offsetY, rotateMatrix));
+        }
+
+        if (this.container.styles.scale !== null) {
+            const origin = this.container.styles.transformOrigin;
+            const offsetX = this.container.bounds.left + getAbsoluteValue(origin[0], this.container.bounds.width);
+            const offsetY = this.container.bounds.top + getAbsoluteValue(origin[1], this.container.bounds.height);
+            const [sx, sy] = this.container.styles.scale;
+            this.effects.push(new TransformEffect(offsetX, offsetY, [sx, 0, 0, sy, 0, 0]));
         }
 
         if (this.container.styles.transform !== null) {
@@ -110,21 +139,61 @@ export class ElementPaint {
         }
 
         if (this.container.styles.zoom !== 1) {
-            const origin = this.container.styles.transformOrigin;
-            const offsetX = this.container.bounds.left + getAbsoluteValue(origin[0], this.container.bounds.width);
-            const offsetY = this.container.bounds.top + getAbsoluteValue(origin[1], this.container.bounds.height);
+            // CSS `zoom` lays the element out in unzoomed coordinates and
+            // scales the whole render by the zoom factor from the element's
+            // visual top-left corner. parseChildNode has already converted
+            // this subtree's bounds/textBounds back to unzoomed layout
+            // coordinates relative to that corner, so zooming the entire
+            // paint with the corner as the fixed point restores both the
+            // visual size and the left alignment.
+            const offsetX = this.container.bounds.left;
+            const offsetY = this.container.bounds.top;
             const z = this.container.styles.zoom;
             const zoomMatrix: Matrix = [z, 0, 0, z, 0, 0];
             this.effects.push(new TransformEffect(offsetX, offsetY, zoomMatrix));
         }
     }
 
-    getEffects(target: EffectTarget): IElementEffect[] {
+    getEffects(target: EffectTarget, surfaceRoot?: ElementPaint): IElementEffect[] {
+        // The ElementPaint tree is fully built before rendering begins, so the
+        // ancestor walk below is deterministic per node. Memoise it for the
+        // plain render path (surfaceRoot undefined), which resolves the same
+        // two target masks for every element of every render. The composited
+        // filter-surface path passes a surfaceRoot whose filtering depends on
+        // the caller, so it always recomputes.
+        if (!surfaceRoot) {
+            let cache = this.plainEffectsCache;
+            if (!cache) {
+                cache = new Map();
+                this.plainEffectsCache = cache;
+            }
+            let cached = cache.get(target);
+            if (!cached) {
+                cached = this.computeEffects(target);
+                cache.set(target, cached);
+            }
+            return cached;
+        }
+        return this.computeEffects(target, surfaceRoot);
+    }
+
+    private computeEffects(target: EffectTarget, surfaceRoot?: ElementPaint): IElementEffect[] {
         let inFlow = [POSITION.ABSOLUTE, POSITION.FIXED].indexOf(this.container.styles.position) === -1;
-        let parent = this.parent;
-        const effects = this.effects.slice(0);
+        let parent = this === surfaceRoot ? null : this.parent;
+        // The surface root owns its filter/opacity/blend (applied when the
+        // surface is composited onto the backdrop). Its overflow clip,
+        // however, must stay in the surface: it clips the root's own direct
+        // content while the surface is painted, and cannot be reconstructed
+        // afterwards without losing the border-radius part of the path.
+        const sourceEffects = (paint: ElementPaint) =>
+            paint.effects.filter(
+                (effect) =>
+                    paint !== surfaceRoot ||
+                    (!isFilterEffect(effect) && !isOpacityEffect(effect) && !isBlendEffect(effect))
+            );
+        const effects = sourceEffects(this);
         while (parent) {
-            const croplessEffects = parent.effects.filter((effect) => !isClipEffect(effect));
+            const croplessEffects = sourceEffects(parent).filter((effect) => !isClipEffect(effect));
             if (inFlow || parent.container.styles.position !== POSITION.STATIC || !parent.parent) {
                 inFlow = [POSITION.ABSOLUTE, POSITION.FIXED].indexOf(parent.container.styles.position) === -1;
                 if (hasOverflowClip(parent.container.styles)) {
@@ -141,7 +210,7 @@ export class ElementPaint {
                 effects.unshift(...croplessEffects);
             }
 
-            parent = parent.parent;
+            parent = parent === surfaceRoot ? null : parent.parent;
         }
 
         return effects.filter((effect) => contains(effect.target, target));
@@ -242,9 +311,9 @@ export const buildClipPathEffect = (clipPath: ClipPathValue, bounds: Bounds): Cl
             return new ClipPathEffect((ctx) => {
                 ctx.beginPath();
                 if (absPoints.length > 0) {
-                    ctx.moveTo(absPoints[0][0], absPoints[0][1]);
+                    ctx.moveTo(at(at(absPoints, 0), 0), at(at(absPoints, 0), 1));
                     for (let i = 1; i < absPoints.length; i++) {
-                        ctx.lineTo(absPoints[i][0], absPoints[i][1]);
+                        ctx.lineTo(at(at(absPoints, i), 0), at(at(absPoints, i), 1));
                     }
                     ctx.closePath();
                 }
@@ -279,6 +348,18 @@ export const buildClipPathEffect = (clipPath: ClipPathValue, bounds: Bounds): Cl
                 } catch (_e) {
                     // Path2D or getTransform/setTransform not supported in this environment.
                 }
+            });
+        }
+
+        case CLIP_PATH_TYPE.XYWH: {
+            const x = bLeft + getAbsoluteValue(clipPath.x, bWidth);
+            const y = bTop + getAbsoluteValue(clipPath.y, bHeight);
+            const w = Math.max(0, getAbsoluteValue(clipPath.width, bWidth));
+            const h = Math.max(0, getAbsoluteValue(clipPath.height, bHeight));
+            return new ClipPathEffect((ctx) => {
+                ctx.beginPath();
+                ctx.rect(x, y, w, h);
+                ctx.clip();
             });
         }
 
@@ -318,14 +399,21 @@ const parseStackTree = (
 
             const stack = new StackingContext(paintContainer);
 
-            if (child.styles.isPositioned() || child.styles.opacity < 1 || child.styles.isTransformed()) {
+            // Stacking contexts formed by non-positioned elements (filter, isolation,
+            // mask, ...) paint in the same layer as a positioned z-index: 0 element.
+            if (
+                treatAsRealStackingContext ||
+                child.styles.isPositioned() ||
+                child.styles.opacity < 1 ||
+                child.styles.isTransformed()
+            ) {
                 const order = child.styles.zIndex.order;
                 if (order < 0) {
                     let index = 0;
 
                     parentStack.negativeZIndex.some((current, i) => {
-                        if (order > current.element.container.styles.zIndex.order) {
-                            index = i;
+                        if (order >= current.element.container.styles.zIndex.order) {
+                            index = i + 1;
                             return false;
                         } else if (index > 0) {
                             return true;
@@ -384,7 +472,7 @@ const processListItems = (owner: ElementContainer, elements: ElementPaint[]) => 
     let numbering = owner instanceof OLElementContainer ? owner.start : 1;
     const reversed = owner instanceof OLElementContainer ? owner.reversed : false;
     for (let i = 0; i < elements.length; i++) {
-        const item = elements[i];
+        const item = at(elements, i);
         if (
             item.container instanceof LIElementContainer &&
             typeof item.container.value === 'number' &&

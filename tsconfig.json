@@ -6,23 +6,20 @@
         "noUnusedParameters": true,
         "strictNullChecks": true,
         "strictPropertyInitialization": true,
-        "noUncheckedIndexedAccess": false,
+        "noUncheckedIndexedAccess": true,
         "types": ["node", "vitest/globals"],
-        "target": "es2020",
+        "target": "es2022",
         "module": "esnext",
-        "lib": ["es2020", "dom"],
-        "outDir": "dist/lib",
+        "lib": ["es2022", "dom", "dom.iterable"],
+        "outDir": "build/lib",
         "declaration": true,
         "skipLibCheck": true,
         "declarationDir": "dist/types",
         "resolveJsonModule": true,
-        "moduleResolution": "node",
+        "rootDir": "src",
+        "moduleResolution": "bundler",
         "esModuleInterop": true,
         "allowSyntheticDefaultImports": true
     },
-    "include": ["src"],
-    "ts-node": {
-        "esm": true,
-        "experimentalSpecifierResolution": "node"
-    }
+    "include": ["src"]
 }

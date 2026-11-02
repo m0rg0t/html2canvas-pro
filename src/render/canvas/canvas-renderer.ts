@@ -2,30 +2,56 @@ import { ElementPaint, parseStackingContexts, StackingContext } from '../stackin
 import { Color } from '../../css/types/color';
 import { asString, isTransparent } from '../../css/types/color-utilities';
 import { ElementContainer } from '../../dom/element-container';
+import { BoxShadow } from '../../css/property-descriptors/box-shadow';
 import { BORDER_STYLE } from '../../css/property-descriptors/border-style';
 import { Path, transformPath } from '../path';
 import { BACKGROUND_CLIP } from '../../css/property-descriptors/background-clip';
 import { BoundCurves, calculateBorderBoxPath, calculateContentBoxPath, calculatePaddingBoxPath } from '../bound-curves';
-import { CSSImageType, CSSURLImage } from '../../css/types/image';
+import {
+    CSSImageType,
+    CSSURLImage,
+    CSSLinearGradientImage,
+    CSSRadialGradientImage,
+    CSSConicGradientImage,
+    ICSSImage
+} from '../../css/types/image';
+import { calculateGradientDirection, calculateRadius, processColorStops } from '../../css/types/functions/gradient';
+import { getAbsoluteValue, FIFTY_PERCENT } from '../../css/types/length-percentage';
+import { rasterizeRadialGradient, stackRepeatingStops, toCanvasStops } from './gradient-rasterizer';
+import { at } from '../../core/util';
 import { getBackgroundValueForIndex } from '../background';
 import { contentBox } from '../box-sizing';
 import { ReplacedElementContainer } from '../../dom/replaced-elements';
-import { EffectTarget } from '../effects';
+import { EffectTarget, isBlendEffect, isClipEffect, isFilterEffect, isOpacityEffect } from '../effects';
+import { CLIP_PATH_TYPE } from '../../css/property-descriptors/clip-path';
+import { MIX_BLEND_MODE } from '../../css/property-descriptors/mix-blend-mode';
+import {
+    FilterSurfaceError,
+    filterOutset,
+    parseFilterChain,
+    releaseSurface,
+    renderFilterSurface,
+    ParsedFilter
+} from './filter-surface';
+import { cropSurface, reserveSurface, surfaceBounds, SurfaceBudget } from './surface-bounds';
+import { Bounds } from '../../css/layout/bounds';
+import { DISPLAY } from '../../css/property-descriptors/display';
+import { contains } from '../../core/bitwise';
 import { TextRenderer } from './text-renderer';
 import { Context } from '../../core/context';
 import { BackgroundRenderer } from './background-renderer';
 import { BorderRenderer } from './border-renderer';
-import { BorderImageRenderer } from './border-image-renderer';
+import { BorderImageRenderer, resolveBorderImageOutset, resolveBorderImageWidths } from './border-image-renderer';
 import { EffectsRenderer } from './effects-renderer';
 import { createCanvasPath, formatCanvasPath } from './canvas-path';
+import { OUTLINE_STYLE } from '../../css/property-descriptors/outline';
+import { paintMaskLayers } from './mask-renderer';
+import { BoxReflect } from '../../css/property-descriptors/webkit-box-reflect';
 import { calculateObjectFitRendering } from '../object-fit';
 import { renderReplacedElements, renderFormElements, renderListMarker } from './content-renderer';
-import { SHADOW_MASK_OFFSET } from '../../core/constants';
-import { DIRECTION } from '../../css/property-descriptors/direction';
-import { isVerticalWritingMode, WRITING_MODE } from '../../css/property-descriptors/writing-mode';
-import { measureBaseline } from './font-utils';
+import { paintBoxShadow } from './box-shadow-painter';
+import { TextClipRenderer } from './text-clip-renderer';
 import { CSSParsedDeclaration } from '../../css/index';
-import { segmentGraphemes, TextBounds } from '../../css/layout/text';
 
 export type RenderConfigurations = RenderOptions & {
     backgroundColor: Color | null;
@@ -66,13 +92,22 @@ export class CanvasRenderer {
     private readonly borderImageRenderer: BorderImageRenderer;
     private readonly effectsRenderer: EffectsRenderer;
     private readonly textRenderer: TextRenderer;
+    private readonly textClipRenderer: TextClipRenderer;
+    private legacySubtree = false;
 
-    constructor(context: Context, options: RenderConfigurations) {
+    constructor(
+        context: Context,
+        options: RenderConfigurations,
+        private readonly surfaceRoot?: ElementPaint,
+        private readonly surfaceBudget: SurfaceBudget = { pixels: 0 }
+    ) {
         this.context = context;
         this.options = options;
-        this.canvas = options.canvas ? options.canvas : document.createElement('canvas');
+        this.canvas = options.canvas ? options.canvas : context.resourceDocument.createElement('canvas');
         const ctx = this.canvas.getContext('2d');
         if (!ctx) {
+            if (!options.canvas) releaseSurface(this.canvas);
+            if (surfaceRoot) throw new FilterSurfaceError('Filter surface canvas is unavailable');
             throw new Error('Failed to get 2D rendering context from canvas');
         }
         this.ctx = ctx;
@@ -116,11 +151,21 @@ export class CanvasRenderer {
 
         this.borderImageRenderer = new BorderImageRenderer(this.ctx);
 
-        this.effectsRenderer = new EffectsRenderer({ ctx: this.ctx }, { path: (paths) => this.path(paths) });
+        this.effectsRenderer = new EffectsRenderer(
+            { ctx: this.ctx, scale: options.scale },
+            { path: (paths) => this.path(paths) }
+        );
 
         this.textRenderer = new TextRenderer({
             ctx: this.ctx,
             options: { scale: options.scale }
+        });
+
+        this.textClipRenderer = new TextClipRenderer({
+            ctx: this.ctx,
+            context: this.context,
+            scale: options.scale,
+            createFontStyle: (styles) => this.textRenderer.createFontStyle(styles)
         });
 
         this.context.logger.debug(
@@ -131,7 +176,320 @@ export class CanvasRenderer {
     async renderStack(stack: StackingContext): Promise<void> {
         const styles = stack.element.container.styles;
         if (styles.isVisible()) {
+            const filter = parseFilterChain(styles.filter);
+            const hasFilter = filter !== null && filter.functions.length > 0;
+            const hasMask = styles.maskImage.length > 0;
+            const reflect = styles.webkitBoxReflect;
+            // mix-blend-mode blends the element (background + content) as one
+            // isolated group with the backdrop, so it also requires the
+            // composited surface path — setting globalCompositeOperation on
+            // the main canvas would blend each paint call separately and,
+            // for light-coloured content (white text over multiply), erase it.
+            const hasBlend = styles.mixBlendMode !== MIX_BLEND_MODE.NORMAL;
+            if (
+                stack.element !== this.surfaceRoot &&
+                !this.legacySubtree &&
+                (hasMask || reflect || hasBlend || (filter !== null && (hasFilter || styles.opacity < 1))) &&
+                this.canComposite(stack.element)
+            ) {
+                if (!(await this.renderCompositedStack(stack, filter, hasMask, reflect, hasBlend))) {
+                    // A rejected optional surface must preserve the previous subtree path.
+                    this.legacySubtree = true;
+                    try {
+                        await this.renderStackContent(stack);
+                    } finally {
+                        this.legacySubtree = false;
+                    }
+                }
+                return;
+            }
             await this.renderStackContent(stack);
+        }
+    }
+
+    // Draft scope: transformed and clip-path subtrees keep the old path.
+    // The surface root owns its filter/opacity; ancestors are applied at composition.
+    private canComposite(paint: ElementPaint): boolean {
+        const supported = (container: ElementContainer): boolean => {
+            const styles = container.styles;
+            return (
+                !styles.isTransformed() &&
+                styles.zoom === 1 &&
+                styles.clipPath.type === CLIP_PATH_TYPE.NONE &&
+                !contains(styles.display, DISPLAY.LIST_ITEM) &&
+                parseFilterChain(styles.filter) !== null
+            );
+        };
+        const subtree = (container: ElementContainer): boolean =>
+            supported(container) && container.elements.every(subtree);
+        let ancestor = paint.parent;
+        while (ancestor && ancestor !== this.surfaceRoot) {
+            if (!supported(ancestor.container)) return false;
+            ancestor = ancestor.parent;
+        }
+        return subtree(paint.container);
+    }
+
+    private async renderCompositedStack(
+        stack: StackingContext,
+        filter: ParsedFilter | null,
+        hasMask: boolean,
+        reflect: BoxReflect | null,
+        hasBlend = false
+    ): Promise<boolean> {
+        const signal = this.options.signal;
+        if (signal?.aborted) throw new DOMException('The operation was aborted.', 'AbortError');
+        const bounds = cropSurface(
+            surfaceBounds(stack.element.container),
+            new Bounds(this.options.x, this.options.y, this.options.width, this.options.height),
+            filter ? filterOutset(filter) : 0,
+            this.options.scale
+        );
+        if (!bounds.width || !bounds.height) return true;
+        const reserved = reserveSurface(
+            this.surfaceBudget,
+            Math.ceil(bounds.width * this.options.scale),
+            Math.ceil(bounds.height * this.options.scale)
+        );
+        if (!reserved) {
+            this.context.logger.info('Filter surface budget exceeded; using the existing renderer');
+            return false;
+        }
+        const options = {
+            ...this.options,
+            canvas: undefined,
+            backgroundColor: null,
+            x: bounds.left,
+            y: bounds.top,
+            width: bounds.width,
+            height: bounds.height
+        };
+        let source: CanvasRenderer | undefined;
+        let filtered: HTMLCanvasElement | undefined;
+        try {
+            source = new CanvasRenderer(this.context, options, stack.element, this.surfaceBudget);
+            await source.renderStackContent(stack);
+            source.effectsRenderer.applyEffects([]);
+            if (filter) {
+                filtered = await renderFilterSurface(
+                    source.canvas,
+                    filter,
+                    stack.element.container.styles.opacity,
+                    options.scale,
+                    signal
+                );
+            }
+            const composited = filtered ?? source.canvas;
+            if (hasMask) {
+                await this.applyMask(composited, stack.element.container.styles, bounds);
+            }
+            if (signal?.aborted) throw new DOMException('The operation was aborted.', 'AbortError');
+            const own = stack.element.effects;
+            const effects = stack.element
+                .getEffects(EffectTarget.CONTENT, this.surfaceRoot)
+                .filter(
+                    (effect) =>
+                        !own.includes(effect) ||
+                        (!isFilterEffect(effect) &&
+                            !isOpacityEffect(effect) &&
+                            !isBlendEffect(effect) &&
+                            !isClipEffect(effect))
+                );
+            this.effectsRenderer.applyEffects(effects);
+            if (hasBlend) {
+                // The isolated surface already contains the element's full
+                // paint (background + content), including its opacity —
+                // renderFilterSurface bakes it even for empty filter chains.
+                // Blend it with the backdrop as one group via the element's
+                // mix-blend-mode. save/restore keeps the composite operation
+                // from leaking into later paints.
+                this.ctx.save();
+                this.ctx.globalCompositeOperation = stack.element.container.styles
+                    .mixBlendMode as GlobalCompositeOperation;
+                this.ctx.drawImage(
+                    composited,
+                    options.x,
+                    options.y,
+                    composited.width / options.scale,
+                    composited.height / options.scale
+                );
+                this.ctx.restore();
+            } else {
+                this.ctx.drawImage(
+                    composited,
+                    options.x,
+                    options.y,
+                    composited.width / options.scale,
+                    composited.height / options.scale
+                );
+            }
+            if (reflect) {
+                await this.drawReflection(composited, stack.element.container.bounds, bounds, reflect);
+            }
+            return true;
+        } catch (error) {
+            if (!(error instanceof FilterSurfaceError)) throw error;
+            this.context.logger.info(`${error.message}; using the existing renderer`);
+            return false;
+        } finally {
+            if (source) releaseSurface(source.canvas);
+            if (filtered) releaseSurface(filtered);
+            this.surfaceBudget.pixels -= reserved;
+        }
+    }
+
+    /**
+     * Composite an alpha mask onto a finished element surface: all mask
+     * layers are painted additively into a mask surface, then kept pixels are
+     * selected with destination-in.
+     */
+    private async applyMask(surface: HTMLCanvasElement, styles: CSSParsedDeclaration, bounds: Bounds): Promise<void> {
+        const ctx = surface.getContext('2d');
+        if (!ctx) {
+            return;
+        }
+        const maskCanvas = this.context.resourceDocument.createElement('canvas');
+        maskCanvas.width = surface.width;
+        maskCanvas.height = surface.height;
+        const maskCtx = maskCanvas.getContext('2d');
+        if (!maskCtx) {
+            releaseSurface(maskCanvas);
+            return;
+        }
+        // The surface's device-pixel origin corresponds to the element bounds
+        // origin, while mask layers paint in page coordinates — align them.
+        maskCtx.scale(this.options.scale, this.options.scale);
+        maskCtx.translate(-bounds.left, -bounds.top);
+        try {
+            await paintMaskLayers(
+                maskCtx,
+                styles.maskImage,
+                styles,
+                { left: bounds.left, top: bounds.top, width: bounds.width, height: bounds.height },
+                async (url) => await this.context.cache.match(url)
+            );
+        } catch (error) {
+            this.context.logger.error(`Error rendering mask-image: ${error instanceof Error ? error.message : error}`);
+            releaseSurface(maskCanvas);
+            return;
+        }
+        ctx.save();
+        try {
+            ctx.setTransform(1, 0, 0, 1, 0, 0); // device pixels for the composite
+            ctx.globalCompositeOperation = 'destination-in';
+            ctx.drawImage(maskCanvas, 0, 0);
+        } finally {
+            ctx.restore();
+            releaseSurface(maskCanvas);
+        }
+    }
+
+    /**
+     * Mirror the element surface in the given direction and offset, optionally
+     * masked (the -webkit-box-reflect mask applies in element space, so it is
+     * composited in the mirrored space where the reflection was drawn).
+     */
+    private async drawReflection(
+        composited: HTMLCanvasElement,
+        elementBounds: Bounds,
+        surfaceBoundsObj: Bounds,
+        reflect: BoxReflect
+    ): Promise<void> {
+        const scale = this.options.scale;
+        const w = Math.ceil(elementBounds.width * scale);
+        const h = Math.ceil(elementBounds.height * scale);
+        if (w <= 0 || h <= 0) {
+            return;
+        }
+        const reserved = reserveSurface(this.surfaceBudget, w, h);
+        if (!reserved) {
+            return;
+        }
+        let refCanvas: HTMLCanvasElement | undefined;
+        let maskCanvas: HTMLCanvasElement | undefined;
+        try {
+            refCanvas = this.context.resourceDocument.createElement('canvas');
+            refCanvas.width = w;
+            refCanvas.height = h;
+            const ctx = refCanvas.getContext('2d');
+            if (!ctx) {
+                return;
+            }
+            const offX = Math.round((elementBounds.left - surfaceBoundsObj.left) * scale);
+            const offY = Math.round((elementBounds.top - surfaceBoundsObj.top) * scale);
+            const horizontal = reflect.direction === 'left' || reflect.direction === 'right';
+            ctx.save();
+            try {
+                if (horizontal) {
+                    ctx.translate(w, 0);
+                    ctx.scale(-1, 1);
+                } else {
+                    ctx.translate(0, h);
+                    ctx.scale(1, -1);
+                }
+                ctx.drawImage(composited, -offX, -offY);
+            } finally {
+                ctx.restore();
+            }
+
+            if (reflect.mask) {
+                // The mask surface must match the reflection's device-pixel
+                // size (w×h here is already device scale). Painting it at CSS
+                // dimensions would only cover the top-left fraction of the
+                // reflection, and destination-in would erase the rest.
+                maskCanvas = this.context.resourceDocument.createElement('canvas');
+                maskCanvas.width = w;
+                maskCanvas.height = h;
+                const mctx = maskCanvas.getContext('2d');
+                if (mctx) {
+                    mctx.scale(scale, scale);
+                    await paintMaskLayers(
+                        mctx,
+                        [reflect.mask],
+                        {
+                            maskPosition: [],
+                            maskRepeat: [],
+                            maskSize: []
+                        },
+                        { left: 0, top: 0, width: elementBounds.width, height: elementBounds.height },
+                        async (url) => await this.context.cache.match(url)
+                    );
+                    ctx.save();
+                    try {
+                        if (horizontal) {
+                            ctx.translate(w, 0);
+                            ctx.scale(-1, 1);
+                        } else {
+                            ctx.translate(0, h);
+                            ctx.scale(1, -1);
+                        }
+                        ctx.globalCompositeOperation = 'destination-in';
+                        ctx.drawImage(maskCanvas, 0, 0, w, h);
+                    } finally {
+                        ctx.restore();
+                    }
+                }
+            }
+
+            const offset = reflect.offset;
+            let x = elementBounds.left;
+            let y = elementBounds.top;
+            if (reflect.direction === 'below') y = elementBounds.top + elementBounds.height + offset;
+            else if (reflect.direction === 'above') y = elementBounds.top - elementBounds.height - offset;
+            else if (reflect.direction === 'right') x = elementBounds.left + elementBounds.width + offset;
+            else x = elementBounds.left - elementBounds.width - offset;
+
+            this.ctx.save();
+            try {
+                this.ctx.filter = 'none';
+                this.ctx.drawImage(refCanvas, x, y, elementBounds.width, elementBounds.height);
+            } finally {
+                this.ctx.restore();
+            }
+        } finally {
+            if (refCanvas) releaseSurface(refCanvas);
+            if (maskCanvas) releaseSurface(maskCanvas);
+            this.surfaceBudget.pixels -= reserved;
         }
     }
 
@@ -179,7 +537,7 @@ export class CanvasRenderer {
     }
 
     async renderNodeContent(paint: ElementPaint): Promise<void> {
-        this.effectsRenderer.applyEffects(paint.getEffects(EffectTarget.CONTENT));
+        this.effectsRenderer.applyEffects(paint.getEffects(EffectTarget.CONTENT, this.surfaceRoot));
         const container = paint.container;
         const curves = paint.curves;
         const styles = container.styles;
@@ -270,23 +628,6 @@ export class CanvasRenderer {
         }
     }
 
-    mask(paths: Path[]): void {
-        this.ctx.beginPath();
-        // Anchor the mask rectangle to (options.x, options.y) instead of (0, 0)
-        // because ctx.translate(-options.x, -options.y) shifts the coordinate system.
-        // Fix for Issue #230: inset box-shadow rendering was inverted for elements
-        // not at document origin due to the mask covering the wrong region.
-        const x = this.options.x;
-        const y = this.options.y;
-        this.ctx.moveTo(x, y);
-        this.ctx.lineTo(x + this.options.width, y);
-        this.ctx.lineTo(x + this.options.width, y + this.options.height);
-        this.ctx.lineTo(x, y + this.options.height);
-        this.ctx.lineTo(x, y);
-        this.formatPath(paths.slice(0).reverse());
-        this.ctx.closePath();
-    }
-
     path(paths: Path[]): void {
         createCanvasPath(this.ctx, paths);
     }
@@ -295,8 +636,87 @@ export class CanvasRenderer {
         formatCanvasPath(this.ctx, paths);
     }
 
+    private async renderSurfaceBoxShadow(paint: ElementPaint, shadow: BoxShadow[number]): Promise<void> {
+        // Rasterize a visible silhouette, then blur it. Linux WebKit can drop the
+        // interior of Canvas shadows whose solid mask is outside a cropped canvas.
+        const spread = shadow.spread.number;
+        const blur = shadow.blur.number / 2;
+        const margin = Math.ceil(3 * blur) + 1;
+        const box = paint.container.bounds.add(-spread, -spread, 2 * spread, 2 * spread);
+        if (box.width <= 0 || box.height <= 0) return;
+        const scale = this.options.scale;
+        const bounds = cropSurface(
+            box.add(-margin, -margin, 2 * margin, 2 * margin),
+            new Bounds(
+                this.options.x - shadow.offsetX.number,
+                this.options.y - shadow.offsetY.number,
+                this.options.width,
+                this.options.height
+            ),
+            margin,
+            scale
+        );
+        if (!bounds.width || !bounds.height) return;
+        const width = Math.ceil(bounds.width * scale),
+            height = Math.ceil(bounds.height * scale);
+        const reserved = reserveSurface(this.surfaceBudget, width, height);
+        if (!reserved) throw new FilterSurfaceError('Box shadow surface budget exceeded');
+        let source: HTMLCanvasElement | undefined;
+        let filtered: HTMLCanvasElement | undefined;
+        try {
+            source = this.context.resourceDocument.createElement('canvas');
+            source.width = width;
+            source.height = height;
+            const ctx = source.getContext('2d');
+            if (!ctx) throw new FilterSurfaceError('Box shadow surface canvas is unavailable');
+            ctx.scale(scale, scale);
+            ctx.translate(-bounds.left, -bounds.top);
+            createCanvasPath(
+                ctx,
+                transformPath(calculateBorderBoxPath(paint.curves), -spread, -spread, 2 * spread, 2 * spread)
+            );
+            ctx.fillStyle = asString(shadow.color);
+            ctx.fill();
+            filtered = await renderFilterSurface(
+                source,
+                { functions: [{ kind: 'blur', value: blur }] },
+                1,
+                scale,
+                this.options.signal
+            );
+            this.ctx.save();
+            try {
+                this.ctx.beginPath();
+                this.ctx.rect(this.options.x, this.options.y, this.options.width, this.options.height);
+                formatCanvasPath(this.ctx, calculateBorderBoxPath(paint.curves));
+                this.ctx.closePath();
+                this.ctx.clip('evenodd');
+                this.ctx.drawImage(
+                    filtered,
+                    bounds.left + shadow.offsetX.number,
+                    bounds.top + shadow.offsetY.number,
+                    filtered.width / scale,
+                    filtered.height / scale
+                );
+            } finally {
+                this.ctx.restore();
+            }
+        } finally {
+            if (source) releaseSurface(source);
+            if (filtered) releaseSurface(filtered);
+            this.surfaceBudget.pixels -= reserved;
+        }
+    }
+
     async renderNodeBackgroundAndBorders(paint: ElementPaint): Promise<void> {
-        this.effectsRenderer.applyEffects(paint.getEffects(EffectTarget.BACKGROUND_BORDERS));
+        this.effectsRenderer.applyEffects(paint.getEffects(EffectTarget.BACKGROUND_BORDERS, this.surfaceRoot));
+        // backdrop-filter filters whatever has already been painted beneath the
+        // element. Capture that region from the main canvas first — anything
+        // painted later (the element itself, higher siblings) is not part of
+        // the backdrop.
+        if (!this.surfaceRoot && paint.container.styles.backdropFilter) {
+            await this.renderBackdropFilter(paint);
+        }
         const styles = paint.container.styles;
         const hasBackground = !isTransparent(styles.backgroundColor) || styles.backgroundImage.length;
         const hasTextClip = hasTextBackgroundClip(styles);
@@ -314,7 +734,7 @@ export class CanvasRenderer {
         if (hasBackground || styles.boxShadow.length) {
             // Handle background-clip: text
             if (hasTextClip && paint.container.textNodes.length > 0) {
-                await this.renderTextClippedBackground(paint);
+                await this.textClipRenderer.render(paint);
             } else {
                 this.ctx.save();
                 this.path(backgroundPaintingArea);
@@ -330,65 +750,58 @@ export class CanvasRenderer {
                 this.ctx.restore();
             }
 
-            styles.boxShadow
-                .slice(0)
-                .reverse()
-                .forEach((shadow) => {
-                    this.ctx.save();
-                    const borderBoxArea = calculateBorderBoxPath(paint.curves);
-                    const maskOffset = shadow.inset ? 0 : SHADOW_MASK_OFFSET;
-                    const shadowPaintingArea = transformPath(
-                        borderBoxArea,
-                        -maskOffset + (shadow.inset ? 1 : -1) * shadow.spread.number,
-                        (shadow.inset ? 1 : -1) * shadow.spread.number,
-                        shadow.spread.number * (shadow.inset ? -2 : 2),
-                        shadow.spread.number * (shadow.inset ? -2 : 2)
-                    );
-
-                    if (shadow.inset) {
-                        this.path(borderBoxArea);
-                        this.ctx.clip();
-                        this.mask(shadowPaintingArea);
-                    } else {
-                        this.mask(borderBoxArea);
-                        this.ctx.clip();
-                        this.path(shadowPaintingArea);
-                    }
-
-                    this.ctx.shadowOffsetX = shadow.offsetX.number + maskOffset;
-                    this.ctx.shadowOffsetY = shadow.offsetY.number;
-                    this.ctx.shadowColor = asString(shadow.color);
-                    this.ctx.shadowBlur = shadow.blur.number;
-                    this.ctx.fillStyle = shadow.inset ? asString(shadow.color) : 'rgba(0,0,0,1)';
-
-                    this.ctx.fill();
-                    this.ctx.restore();
-                });
+            for (const shadow of styles.boxShadow.slice(0).reverse()) {
+                if (this.surfaceRoot && !shadow.inset) {
+                    await this.renderSurfaceBoxShadow(paint, shadow);
+                    continue;
+                }
+                await paintBoxShadow(this.ctx, paint, shadow, this.options, this.surfaceBudget);
+            }
         }
 
         // Render border-image if present (replaces traditional borders per CSS spec)
         if (styles.borderImageSource) {
             const source = styles.borderImageSource;
+            const bounds = paint.container.bounds;
+            const borderWidths: [number, number, number, number] = [
+                Math.max(0, styles.borderTopWidth),
+                Math.max(0, styles.borderRightWidth),
+                Math.max(0, styles.borderBottomWidth),
+                Math.max(0, styles.borderLeftWidth)
+            ];
+            let image: HTMLImageElement | HTMLCanvasElement | null = null;
             if (source.type === CSSImageType.URL) {
                 const url = (source as CSSURLImage).url;
                 try {
-                    const image = await this.context.cache.match(url);
-                    if (image) {
-                        const bounds = paint.container.bounds;
-                        this.borderImageRenderer.renderBorderImage(
-                            bounds,
-                            image as HTMLImageElement,
-                            styles.borderImageSlice,
-                            styles.borderImageRepeat,
-                            Math.max(0, styles.borderTopWidth),
-                            Math.max(0, styles.borderRightWidth),
-                            Math.max(0, styles.borderBottomWidth),
-                            Math.max(0, styles.borderLeftWidth)
-                        );
-                    }
+                    image = (await this.context.cache.match(url)) ?? null;
                 } catch (e) {
                     this.context.logger.error(`Error loading border-image ${url}`);
                 }
+            } else {
+                // Gradient sources: rasterise the gradient across the border
+                // image area, then run the same 9-slice pipeline as for images.
+                image = this.rasterizeGradientSource(source, bounds);
+            }
+            if (image) {
+                const outset = resolveBorderImageOutset(styles.borderImageOutset, borderWidths);
+                const area = bounds.add(
+                    -outset.left,
+                    -outset.top,
+                    outset.left + outset.right,
+                    outset.top + outset.bottom
+                );
+                const widths = resolveBorderImageWidths(styles.borderImageWidth, borderWidths, area);
+                this.borderImageRenderer.renderBorderImage(
+                    bounds,
+                    image as HTMLImageElement,
+                    styles.borderImageSlice,
+                    styles.borderImageRepeat,
+                    widths[0],
+                    widths[1],
+                    widths[2],
+                    widths[3],
+                    outset
+                );
             }
             // When border-image is present, skip regular border rendering
             return;
@@ -454,145 +867,257 @@ export class CanvasRenderer {
             }
             side++;
         }
-    }
 
-    async render(element: ElementContainer): Promise<HTMLCanvasElement> {
-        if (this.options.backgroundColor) {
-            this.ctx.fillStyle = asString(this.options.backgroundColor);
-            this.ctx.fillRect(this.options.x, this.options.y, this.options.width, this.options.height);
-        }
-
-        const stack = parseStackingContexts(element);
-
-        await this.renderStack(stack);
-        this.effectsRenderer.applyEffects([]);
-        return this.canvas;
+        this.renderOutline(paint);
     }
 
     /**
-     * Render background clipped to text shape using offscreen canvas with destination-in compositing.
-     * This implements background-clip: text support.
-     *
-     * Algorithm:
-     *   1. Draw background (color + images) onto an offscreen canvas
-     *   2. Use destination-in compositing to clip the background to the text glyph shapes
-     *   3. Composite the result back onto the main canvas
-     *
-     * The offscreen canvas uses CSS-pixel dimensions (not device-pixel) because the
-     * background renderer handles scaling internally via BackgroundRenderer options.
+     * Draw the element outline: a single closed stroke around the border box,
+     * offset outwards. Outlines paint atop content and do not affect layout.
      */
-    private async renderTextClippedBackground(paint: ElementPaint): Promise<void> {
-        const container = paint.container;
-        const styles = container.styles;
-        const bounds = container.bounds;
+    private renderOutline(paint: ElementPaint): void {
+        const styles = paint.container.styles;
+        if (styles.outlineStyle === OUTLINE_STYLE.NONE || styles.outlineStyle === OUTLINE_STYLE.AUTO) {
+            return;
+        }
+        const width = Math.max(0, styles.outlineWidth);
+        if (width <= 0) {
+            return;
+        }
+        const color = styles.outlineColor ?? styles.color;
+        if (isTransparent(color)) {
+            return;
+        }
+        const spread = Math.max(0, styles.outlineOffset) + width / 2;
+        const outlinePath = transformPath(
+            calculateBorderBoxPath(paint.curves),
+            -spread,
+            -spread,
+            2 * spread,
+            2 * spread
+        );
 
+        this.ctx.save();
+        try {
+            this.ctx.strokeStyle = asString(color);
+            this.ctx.lineWidth = width;
+            if (styles.outlineStyle === OUTLINE_STYLE.DASHED) {
+                this.ctx.setLineDash([width * 3, width * 3]);
+            } else if (styles.outlineStyle === OUTLINE_STYLE.DOTTED) {
+                this.ctx.setLineDash([width, width * 2]);
+            }
+            this.path(outlinePath);
+            this.ctx.stroke();
+        } finally {
+            this.ctx.restore();
+        }
+    }
+
+    /**
+     * Rasterise a gradient border-image-source across the border image area.
+     * CSS allows any <image> as the border-image source; gradients are painted
+     * over the whole border-image box and then sliced by the regular 9-slice
+     * pipeline, matching browser behaviour for `border-image: linear-gradient()`.
+     * Returns null when the gradient could not be painted.
+     */
+    private rasterizeGradientSource(source: ICSSImage, bounds: Bounds): HTMLCanvasElement | null {
+        const width = Math.max(1, Math.ceil(bounds.width));
+        const height = Math.max(1, Math.ceil(bounds.height));
+        const ownerDocument = this.ctx.canvas.ownerDocument ?? document;
+        const canvas = ownerDocument.createElement('canvas');
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) {
+            return null;
+        }
+
+        if (source.type === CSSImageType.LINEAR_GRADIENT || source.type === CSSImageType.REPEATING_LINEAR_GRADIENT) {
+            const gradientImage = source as CSSLinearGradientImage;
+            const [lineLength, x0, y0, x1, y1] = calculateGradientDirection(gradientImage.angle, width, height);
+            const processed = processColorStops(gradientImage.stops, lineLength || width);
+            const repeating = source.type === CSSImageType.REPEATING_LINEAR_GRADIENT;
+            // Repeating gradients stack the one-cycle stop list periodically.
+            const stacked = repeating ? stackRepeatingStops(processed) : null;
+            const gradient = ctx.createLinearGradient(x0, y0, x1, y1);
+            if (stacked) {
+                stacked.forEach((colorStop) => {
+                    gradient.addColorStop(Math.min(1, Math.max(0, colorStop.stop)), colorStop.color);
+                });
+            } else if (repeating) {
+                // Degenerate period repeats nothing — last colour across the box.
+                const lastColor = asString(at(processed, processed.length - 1).color);
+                gradient.addColorStop(0, lastColor);
+                gradient.addColorStop(1, lastColor);
+            } else {
+                toCanvasStops(processed).forEach((colorStop) => {
+                    gradient.addColorStop(colorStop.stop, colorStop.color);
+                });
+            }
+            ctx.fillStyle = gradient;
+            ctx.fillRect(0, 0, width, height);
+            return canvas;
+        }
+        if (source.type === CSSImageType.RADIAL_GRADIENT || source.type === CSSImageType.REPEATING_RADIAL_GRADIENT) {
+            const gradientImage = source as CSSRadialGradientImage;
+            const position = gradientImage.position.length === 0 ? [FIFTY_PERCENT] : gradientImage.position;
+            const cx = getAbsoluteValue(at(position, 0), width);
+            const cy = getAbsoluteValue(at(position, position.length - 1), height);
+            const [rx, ry] = calculateRadius(gradientImage, cx, cy, width, height);
+            if (rx <= 0 || ry <= 0) {
+                return null;
+            }
+            const ownerDocument = this.ctx.canvas.ownerDocument ?? document;
+            const rasterized = rasterizeRadialGradient(
+                ownerDocument,
+                rx,
+                ry,
+                gradientImage.stops,
+                source.type === CSSImageType.REPEATING_RADIAL_GRADIENT
+            );
+            if (!rasterized) {
+                return null;
+            }
+            // Outside the ending shape the gradient continues with its last
+            // colour, so cover the whole border-image box before drawing the
+            // ellipse (drawn at its 2rx × 2ry device box around the centre).
+            ctx.fillStyle = rasterized.lastColor;
+            ctx.fillRect(0, 0, width, height);
+            ctx.drawImage(rasterized.canvas, cx - rx, cy - ry, rx * 2, ry * 2);
+            releaseSurface(rasterized.canvas);
+            return canvas;
+        }
+        if (source.type === CSSImageType.CONIC_GRADIENT || source.type === CSSImageType.REPEATING_CONIC_GRADIENT) {
+            const gradientImage = source as CSSConicGradientImage;
+            // Canvas conic gradients measure angles from the positive x-axis
+            // clockwise; CSS conic gradients start at the 12 o'clock position.
+            const cx = getAbsoluteValue(at(gradientImage.position, 0), width);
+            const cy = getAbsoluteValue(at(gradientImage.position, 1), height);
+            const gradient = ctx.createConicGradient(gradientImage.angle - Math.PI / 2, cx, cy);
+            let stops: Array<{ stop: number; color: string }>;
+            if (source.type === CSSImageType.REPEATING_CONIC_GRADIENT) {
+                // Stack the one-cycle stop list periodically across the full
+                // sweep; the band covering the end extends flat to 1.
+                const processed = processColorStops(gradientImage.stops, 1);
+                const first = at(processed, 0);
+                const last = at(processed, processed.length - 1);
+                const period = Math.max(last.stop - first.stop, 0.01);
+                stops = [];
+                const cycles = Math.ceil(1 / period);
+                for (let k = 0; k < cycles; k++) {
+                    for (const s of processed) {
+                        const stop = k * period + (s.stop - first.stop);
+                        if (stop > 1) break;
+                        stops.push({ stop, color: asString(s.color) });
+                    }
+                }
+                const lastIncluded = at(stops, stops.length - 1);
+                if (lastIncluded && lastIncluded.stop < 1) {
+                    stops.push({ stop: 1, color: lastIncluded.color });
+                }
+            } else {
+                stops = processColorStops(gradientImage.stops, Math.max(width, height)).map((colorStop) => ({
+                    stop: colorStop.stop,
+                    color: asString(colorStop.color)
+                }));
+            }
+            stops.forEach((s) => {
+                gradient.addColorStop(Math.min(1, Math.max(0, s.stop)), s.color);
+            });
+            ctx.fillStyle = gradient;
+            ctx.fillRect(0, 0, width, height);
+            return canvas;
+        }
+        this.context.logger.warn('Unsupported border-image source; only URL and gradient images are supported');
+        return null;
+    }
+
+    /**
+     * Filter the already-painted content beneath the element's border box and
+     * paint the result back, approximating CSS backdrop-filter for the chain
+     * subset the filter surface backends support.
+     */
+    private async renderBackdropFilter(paint: ElementPaint): Promise<void> {
+        const filter = parseFilterChain(paint.container.styles.backdropFilter);
+        if (!filter || filter.functions.length === 0) {
+            return; // unsupported or empty chain
+        }
+        const bounds = paint.container.bounds;
         if (bounds.width <= 0 || bounds.height <= 0) {
             return;
         }
-
-        const ownerDocument = this.canvas.ownerDocument ?? document;
-        const offscreen = ownerDocument.createElement('canvas');
-        const width = Math.ceil(bounds.width);
-        const height = Math.ceil(bounds.height);
-        offscreen.width = width;
-        offscreen.height = height;
-
-        const offCtx = offscreen.getContext('2d');
-        if (!offCtx) {
+        const scale = this.options.scale;
+        const width = Math.ceil(bounds.width * scale);
+        const height = Math.ceil(bounds.height * scale);
+        if (width <= 0 || height <= 0) {
             return;
         }
-
-        // ── Set up font matching the main context ──
-        const [fontString] = this.textRenderer.createFontStyle(styles);
-        offCtx.font = fontString;
-        offCtx.textBaseline = 'alphabetic';
-        offCtx.textAlign = 'left';
-        offCtx.direction = styles.direction === DIRECTION.RTL ? 'rtl' : 'ltr';
-
-        // Measure baseline from the actual rendered font
-        const baseline = measureBaseline(offCtx, styles.fontSize.number);
-
-        // ── Draw background onto offscreen canvas ──
-        const bgRenderer = new BackgroundRenderer({
-            ctx: offCtx,
-            context: this.context,
-            canvas: offscreen,
-            options: { width, height, scale: 1 }
-        });
-
-        if (!isTransparent(styles.backgroundColor)) {
-            offCtx.fillStyle = asString(styles.backgroundColor);
-            offCtx.fillRect(0, 0, width, height);
+        const reserved = reserveSurface(this.surfaceBudget, width, height);
+        if (!reserved) {
+            return; // budget exhausted: render without the backdrop effect
         }
-
-        // Background images are positioned relative to the element bounds,
-        // so we need the BackgroundRenderer to compute offsets in the same
-        // coordinate space as the main renderer.  We do that by translating
-        // the offscreen context so that the element origin (bounds.left, bounds.top)
-        // falls at (0, 0).
-        offCtx.save();
-        offCtx.translate(-bounds.left, -bounds.top);
-        await bgRenderer.renderBackgroundImage(container);
-        offCtx.restore();
-
-        // ── Clip background to text glyphs ──
-        // destination-in: keep background pixels only where the source (text) is non-transparent.
-        offCtx.globalCompositeOperation = 'destination-in';
-        offCtx.fillStyle = '#000';
-
-        const writingMode = styles.writingMode;
-        const letterSpacing = styles.letterSpacing;
-
-        for (const textNode of container.textNodes) {
-            for (const textBound of textNode.textBounds) {
-                // Offset from element bounds to canvas-local coordinates
-                const localLeft = textBound.bounds.left - bounds.left;
-                const localTop = textBound.bounds.top - bounds.top + baseline;
-
-                if (letterSpacing > 0) {
-                    this.renderTextMaskWithLetterSpacing(
-                        offCtx,
-                        textBound,
-                        letterSpacing,
-                        localLeft,
-                        localTop,
-                        writingMode
-                    );
-                } else {
-                    offCtx.fillText(textBound.text, localLeft, localTop);
-                }
-            }
-        }
-
-        // ── Composite back to main canvas ──
-        this.ctx.drawImage(offscreen, bounds.left, bounds.top);
-    }
-
-    /**
-     * Render text glyphs one-by-one as a mask, applying letter-spacing between characters.
-     * This ensures the mask matches how the text renderer lays out the characters.
-     */
-    private renderTextMaskWithLetterSpacing(
-        ctx: CanvasRenderingContext2D,
-        text: TextBounds,
-        letterSpacing: number,
-        x: number,
-        y: number,
-        writingMode: WRITING_MODE
-    ): void {
-        const letters = segmentGraphemes(text.text);
-        let offset = x;
-
-        for (const letter of letters) {
-            if (isVerticalWritingMode(writingMode)) {
-                // Vertical writing mode: not yet supported for text-clip;
-                // fall back to single fillText call.
-                ctx.fillText(text.text, x, y);
+        let source: HTMLCanvasElement | undefined;
+        let filtered: HTMLCanvasElement | undefined;
+        try {
+            source = this.context.resourceDocument.createElement('canvas');
+            source.width = width;
+            source.height = height;
+            const srcCtx = source.getContext('2d');
+            if (!srcCtx) {
                 return;
             }
+            // Canvas device pixel (0,0) corresponds to CSS (options.x, options.y).
+            const sx = Math.round((bounds.left - this.options.x) * scale);
+            const sy = Math.round((bounds.top - this.options.y) * scale);
+            srcCtx.drawImage(this.canvas, sx, sy, width, height, 0, 0, width, height);
+            try {
+                filtered = await renderFilterSurface(source, filter, 1, scale, this.options.signal);
+            } catch (error) {
+                // Unlike the composited-stack path there is no legacy fallback
+                // for backdrop-filter (tainted canvas, SVG rejection, decode
+                // failure): capture continues without the effect instead of
+                // failing the whole render.
+                if (error instanceof FilterSurfaceError) {
+                    this.context.logger.info(`${error.message}; rendering without the backdrop effect`);
+                    return;
+                }
+                throw error;
+            }
+            if (this.options.signal?.aborted) {
+                throw new DOMException('The operation was aborted.', 'AbortError');
+            }
+            this.ctx.save();
+            try {
+                // An enclosing filter effect must not re-filter the compositing.
+                this.ctx.filter = 'none';
+                this.ctx.drawImage(filtered, bounds.left, bounds.top, bounds.width, bounds.height);
+            } finally {
+                this.ctx.restore();
+            }
+        } finally {
+            if (source) releaseSurface(source);
+            if (filtered) releaseSurface(filtered);
+            this.surfaceBudget.pixels -= reserved;
+        }
+    }
 
-            ctx.fillText(letter, offset, y);
-            offset += ctx.measureText(letter).width + letterSpacing;
+    async render(element: ElementContainer): Promise<HTMLCanvasElement> {
+        try {
+            if (this.options.backgroundColor) {
+                this.ctx.fillStyle = asString(this.options.backgroundColor);
+                this.ctx.fillRect(this.options.x, this.options.y, this.options.width, this.options.height);
+            }
+
+            const stack = parseStackingContexts(element);
+
+            await this.renderStack(stack);
+            this.effectsRenderer.applyEffects([]);
+            return this.canvas;
+        } catch (error) {
+            // Failed captures have no returned canvas. Release only our backing
+            // store; a canvas supplied by the caller remains caller-owned.
+            if (!this.options.canvas) releaseSurface(this.canvas);
+            throw error;
         }
     }
 }

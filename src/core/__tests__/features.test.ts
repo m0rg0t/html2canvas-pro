@@ -1,13 +1,9 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 import { FEATURES, createForeignObjectSVG, loadSerializedSVG } from '../features';
 
 describe('FEATURES', () => {
     it('has boolean SUPPORT_RANGE_BOUNDS', () => {
         expect(typeof FEATURES.SUPPORT_RANGE_BOUNDS).toBe('boolean');
-    });
-
-    it('has boolean SUPPORT_WORD_BREAKING', () => {
-        expect(typeof FEATURES.SUPPORT_WORD_BREAKING).toBe('boolean');
     });
 
     it('has boolean SUPPORT_SVG_DRAWING', () => {
@@ -16,30 +12,6 @@ describe('FEATURES', () => {
 
     it('has boolean SUPPORT_CORS_IMAGES', () => {
         expect(typeof FEATURES.SUPPORT_CORS_IMAGES).toBe('boolean');
-    });
-
-    it('has boolean SUPPORT_RESPONSE_TYPE', () => {
-        expect(typeof FEATURES.SUPPORT_RESPONSE_TYPE).toBe('boolean');
-    });
-
-    it('has boolean SUPPORT_CORS_XHR', () => {
-        expect(typeof FEATURES.SUPPORT_CORS_XHR).toBe('boolean');
-    });
-
-    it('has boolean or Promise SUPPORT_FOREIGNOBJECT_DRAWING', async () => {
-        const val = FEATURES.SUPPORT_FOREIGNOBJECT_DRAWING;
-        expect(typeof val === 'boolean' || val instanceof Promise).toBe(true);
-        // In jsdom, the promise may reject due to missing canvas support; suppress unhandled rejection
-        if (val instanceof Promise) {
-            val.catch(() => {
-                // Suppress expected error in jsdom environment
-            });
-            await val.catch(() => {});
-        }
-    });
-
-    it('has boolean SUPPORT_NATIVE_TEXT_SEGMENTATION', () => {
-        expect(typeof FEATURES.SUPPORT_NATIVE_TEXT_SEGMENTATION).toBe('boolean');
     });
 });
 
@@ -52,7 +24,7 @@ describe('createForeignObjectSVG', () => {
         expect(result.tagName).toBe('svg');
         expect(result.namespaceURI).toBe('http://www.w3.org/2000/svg');
         expect(result.childNodes.length).toBeGreaterThan(0);
-        expect(result.childNodes[0].nodeName).toBe('foreignObject');
+        expect(result.childNodes[0]?.nodeName).toBe('foreignObject');
     });
 });
 
@@ -62,5 +34,172 @@ describe('loadSerializedSVG', () => {
         svg.setAttribute('xmlns', 'http://www.w3.org/2000/svg');
         const result = loadSerializedSVG(svg);
         expect(result).toBeInstanceOf(Promise);
+    });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Detection path coverage
+//
+// Each FEATURES getter memoizes itself with Object.defineProperty on first
+// access, so the descriptors below are captured at module load (before any
+// test runs) to allow re-running each detection under different mocks.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const FEATURE_KEYS = ['SUPPORT_RANGE_BOUNDS', 'SUPPORT_SVG_DRAWING', 'SUPPORT_CORS_IMAGES'] as const;
+
+type FeatureKey = (typeof FEATURE_KEYS)[number];
+
+const originalDescriptors = FEATURE_KEYS.reduce(
+    (acc, key) => {
+        acc[key] = Object.getOwnPropertyDescriptor(FEATURES, key) as PropertyDescriptor;
+        return acc;
+    },
+    {} as Record<FeatureKey, PropertyDescriptor>
+);
+
+/** Re-install the original getter so the next access re-runs the detection. */
+const restoreFeature = (key: FeatureKey): void => {
+    Object.defineProperty(FEATURES, key, originalDescriptors[key]);
+};
+
+describe('FEATURES detection paths', () => {
+    afterEach(() => {
+        vi.restoreAllMocks();
+    });
+
+    describe('SUPPORT_RANGE_BOUNDS', () => {
+        const detect = (): boolean => {
+            restoreFeature('SUPPORT_RANGE_BOUNDS');
+            return FEATURES.SUPPORT_RANGE_BOUNDS;
+        };
+
+        it('returns false when document.createRange is unavailable', () => {
+            const own = Object.getOwnPropertyDescriptor(document, 'createRange');
+            const proto = Object.getOwnPropertyDescriptor(Document.prototype as any, 'createRange');
+            Object.defineProperty(document, 'createRange', { value: undefined, configurable: true });
+            try {
+                expect(detect()).toBe(false);
+            } finally {
+                if (own) {
+                    Object.defineProperty(document, 'createRange', own);
+                } else {
+                    delete (document as any).createRange;
+                }
+                expect(proto).not.toBeUndefined();
+            }
+        });
+
+        it('returns false when the range lacks getBoundingClientRect', () => {
+            const spy = vi.spyOn(document, 'createRange').mockReturnValue({} as Range);
+            try {
+                expect(detect()).toBe(false);
+            } finally {
+                spy.mockRestore();
+            }
+        });
+
+        it('returns false when the measured range height differs from the test element', () => {
+            const spy = vi.spyOn(document, 'createRange').mockReturnValue({
+                selectNode: () => undefined,
+                getBoundingClientRect: () => ({ height: 456 })
+            } as unknown as Range);
+            try {
+                expect(detect()).toBe(false);
+            } finally {
+                spy.mockRestore();
+            }
+        });
+
+        it('returns true when the measured range height matches', () => {
+            const spy = vi.spyOn(document, 'createRange').mockReturnValue({
+                selectNode: () => undefined,
+                getBoundingClientRect: () => ({ height: 123 })
+            } as unknown as Range);
+            try {
+                expect(detect()).toBe(true);
+            } finally {
+                spy.mockRestore();
+            }
+        });
+    });
+
+    describe('SUPPORT_SVG_DRAWING', () => {
+        const detect = (): boolean => {
+            restoreFeature('SUPPORT_SVG_DRAWING');
+            return FEATURES.SUPPORT_SVG_DRAWING;
+        };
+
+        it('returns false when no 2D context is available (jsdom default)', () => {
+            expect(detect()).toBe(false);
+        });
+
+        it('returns true when drawImage and toDataURL succeed', () => {
+            const drawImage = vi.fn();
+            const realCreateElement = document.createElement.bind(document);
+            const spy = vi.spyOn(document, 'createElement').mockImplementation((name: string) => {
+                if (name === 'canvas') {
+                    return {
+                        width: 0,
+                        height: 0,
+                        style: {},
+                        getContext: () => ({ drawImage }),
+                        toDataURL: () => 'data:image/png;base64,AAAA'
+                    } as unknown as HTMLCanvasElement;
+                }
+                return realCreateElement(name);
+            });
+            try {
+                expect(detect()).toBe(true);
+                expect(drawImage).toHaveBeenCalled();
+            } finally {
+                spy.mockRestore();
+            }
+        });
+    });
+
+    describe('CORS detection', () => {
+        it('SUPPORT_CORS_IMAGES is true for real Image elements exposing crossOrigin', () => {
+            restoreFeature('SUPPORT_CORS_IMAGES');
+            expect(FEATURES.SUPPORT_CORS_IMAGES).toBe(true);
+        });
+
+        it('SUPPORT_CORS_IMAGES is false when Image lacks crossOrigin', () => {
+            class BareImage {}
+            vi.stubGlobal('Image', BareImage);
+            try {
+                restoreFeature('SUPPORT_CORS_IMAGES');
+                expect(FEATURES.SUPPORT_CORS_IMAGES).toBe(false);
+            } finally {
+                vi.unstubAllGlobals();
+            }
+        });
+    });
+});
+
+describe('SUPPORT_SVG_DRAWING failure path', () => {
+    it('returns false when drawImage throws (tainted canvas)', () => {
+        const realCreateElement = document.createElement.bind(document);
+        const spy = vi.spyOn(document, 'createElement').mockImplementation((name: string) => {
+            if (name === 'canvas') {
+                return {
+                    width: 0,
+                    height: 0,
+                    style: {},
+                    getContext: () => ({
+                        drawImage: () => {
+                            throw new DOMException('tainted', 'SecurityError');
+                        }
+                    }),
+                    toDataURL: () => 'data:image/png;base64,AAAA'
+                } as unknown as HTMLCanvasElement;
+            }
+            return realCreateElement(name);
+        });
+        try {
+            restoreFeature('SUPPORT_SVG_DRAWING');
+            expect(FEATURES.SUPPORT_SVG_DRAWING).toBe(false);
+        } finally {
+            spy.mockRestore();
+        }
     });
 });

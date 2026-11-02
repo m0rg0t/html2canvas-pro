@@ -265,3 +265,197 @@ describe('Cache cross-origin image loading (issue #229)', () => {
         }
     });
 });
+
+describe('Cache.preloadAll progress callback', () => {
+    it('reports (0, total) once upfront and (settled, total) after each batch', async () => {
+        const config = new Html2CanvasConfig({ window: window });
+        const context = new Context(
+            { logging: false, imageTimeout: 15000, useCORS: false, allowTaint: false },
+            new Bounds(0, 0, 800, 600),
+            config
+        );
+        const cache = new Cache(context, { imageTimeout: 15000, useCORS: false, allowTaint: false });
+
+        class MockImage {
+            crossOrigin: string | null = null;
+            complete = false;
+            onload: (() => void) | null = null;
+            onerror: (() => void) | null = null;
+            set src(_v: string) {
+                setTimeout(() => {
+                    this.complete = true;
+                    this.onload?.();
+                }, 0);
+            }
+        }
+        vi.stubGlobal('Image', MockImage);
+        try {
+            cache.startDefer();
+            cache.addImage('https://example.com/a.png');
+            cache.addImage('https://example.com/b.png');
+            cache.addImage('https://example.com/c.png');
+
+            const events: Array<[number, number]> = [];
+            await cache.preloadAll(2, (loaded, total) => events.push([loaded, total]));
+
+            // 3 URLs at concurrency 2 → batches of 2 then 1.
+            deepStrictEqual(events, [
+                [0, 3],
+                [2, 3],
+                [3, 3]
+            ]);
+        } finally {
+            vi.unstubAllGlobals();
+        }
+    });
+
+    it('does not invoke the callback when nothing was collected', async () => {
+        const config = new Html2CanvasConfig({ window: window });
+        const context = new Context(
+            { logging: false, imageTimeout: 15000, useCORS: false, allowTaint: false },
+            new Bounds(0, 0, 800, 600),
+            config
+        );
+        const cache = new Cache(context, { imageTimeout: 15000, useCORS: false, allowTaint: false });
+
+        const onProgress = vi.fn();
+        await cache.preloadAll(10, onProgress);
+        strictEqual(onProgress.mock.calls.length, 0);
+    });
+});
+
+describe('Cache.defer-mode eviction exemption', () => {
+    const makeCache = (maxCacheSize: number) => {
+        const config = new Html2CanvasConfig({ window: window });
+        const context = new Context(
+            { logging: false, imageTimeout: 15000, useCORS: false, allowTaint: false },
+            new Bounds(0, 0, 800, 600),
+            config
+        );
+        return new Cache(context, { imageTimeout: 15000, useCORS: false, allowTaint: false, maxCacheSize });
+    };
+
+    class MockImage {
+        crossOrigin: string | null = null;
+        complete = false;
+        onload: (() => void) | null = null;
+        onerror: (() => void) | null = null;
+        set src(_v: string) {
+            setTimeout(() => {
+                this.complete = true;
+                this.onload?.();
+            }, 0);
+        }
+    }
+
+    it('keeps every deferred image when more unique URLs are collected than maxSize', async () => {
+        const cache = makeCache(3);
+        vi.stubGlobal('Image', MockImage);
+        try {
+            cache.startDefer();
+            const urls = [
+                'https://example.com/1.png',
+                'https://example.com/2.png',
+                'https://example.com/3.png',
+                'https://example.com/4.png',
+                'https://example.com/5.png'
+            ];
+            urls.forEach((url) => cache.addImage(url));
+            // Collected, not loaded yet.
+            strictEqual(cache.size(), 0);
+
+            await cache.preloadAll(2);
+
+            // The renderer never reloads on match(); every collected image
+            // must still be present even though maxSize is 3.
+            strictEqual(cache.size(), 5);
+            for (const url of urls) {
+                ok(cache.match(url) !== undefined, `${url} must survive the preload window`);
+            }
+        } finally {
+            vi.unstubAllGlobals();
+        }
+    });
+
+    it('resumes LRU eviction after preloadAll completes', async () => {
+        const cache = makeCache(3);
+        vi.stubGlobal('Image', MockImage);
+        try {
+            cache.startDefer();
+            const urls = [
+                'https://example.com/1.png',
+                'https://example.com/2.png',
+                'https://example.com/3.png',
+                'https://example.com/4.png'
+            ];
+            urls.forEach((url) => cache.addImage(url));
+            await cache.preloadAll(2);
+            strictEqual(cache.size(), 4);
+
+            // Normal-mode loads evict again (shared-cache memory bound).
+            cache.addImage('https://example.com/5.png');
+            strictEqual(cache.size(), 4);
+            strictEqual(cache.match('https://example.com/1.png'), undefined);
+            ok(cache.match('https://example.com/5.png') !== undefined);
+        } finally {
+            vi.unstubAllGlobals();
+        }
+    });
+});
+
+describe('Cache image decoding', () => {
+    it('resolves synchronously-complete images via decode() without the 500ms timer', async () => {
+        const decode = vi.fn(() => Promise.resolve());
+        class FakeImage {
+            decode = decode;
+            complete = true;
+            crossOrigin = '';
+            onload: (() => void) | null = null;
+            onerror: (() => void) | null = null;
+            src = '';
+        }
+        const src = 'data:image/png;base64,AAAA';
+        const mockWindow = {
+            Image: FakeImage,
+            document: {
+                createElement: (_name: string) => {
+                    let _href = '';
+                    return {
+                        set href(value: string) {
+                            _href = value;
+                        },
+                        get href() {
+                            return _href;
+                        },
+                        get protocol() {
+                            return 'http:';
+                        },
+                        get hostname() {
+                            return 'localhost';
+                        },
+                        get port() {
+                            return '';
+                        }
+                    };
+                }
+            },
+            location: { href: 'http://localhost/' }
+        } as unknown as Window;
+
+        const context = new Context(
+            { logging: false, imageTimeout: 5000, useCORS: false, allowTaint: false },
+            new Bounds(0, 0, 800, 600),
+            new Html2CanvasConfig({ window: mockWindow })
+        );
+        const cache = new Cache(context, {
+            imageTimeout: 5000,
+            useCORS: false,
+            allowTaint: false
+        });
+
+        await cache.addImage(src);
+        const image = await cache.match(src);
+        expect(image).toBeInstanceOf(FakeImage);
+        expect(decode).toHaveBeenCalledTimes(1);
+    });
+});

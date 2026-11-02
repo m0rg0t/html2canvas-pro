@@ -1,5 +1,5 @@
 import { Bounds, parseBounds, parseDocumentSize } from '../css/layout/bounds';
-import { COLORS } from '../css/types/color';
+import { TRANSPARENT_COLOR } from '../css/types/color';
 import { CloneConfigurations, DocumentCloner } from '../dom/document-cloner';
 import { isBodyElement, isHTMLElement } from '../dom/node-type-guards';
 import { parseTree } from '../dom/node-parser';
@@ -21,6 +21,35 @@ import {
     assembleRenderOptions
 } from './config-assembler';
 import { parseBackgroundColor } from './background-parser';
+
+/**
+ * Progress milestones emitted via `Options.onProgress`.
+ * Phase names are stable API; percentages are coarse estimates.
+ */
+export const enum ProgressPhase {
+    CLONE = 'clone',
+    PARSE = 'parse',
+    PRELOAD = 'preload',
+    LAYOUT = 'layout',
+    RENDER = 'render'
+}
+
+const emitProgress = (
+    onProgress: ((phase: string, progress: number) => void) | undefined,
+    context: Context,
+    phase: string,
+    progress: number
+): void => {
+    if (!onProgress) {
+        return;
+    }
+    try {
+        onProgress(phase, progress);
+    } catch (error) {
+        // A broken consumer callback must never break the render itself.
+        context.logger.error(`onProgress callback failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+};
 
 export const renderElement = async (
     element: HTMLElement,
@@ -93,6 +122,8 @@ export const renderElement = async (
         } scrolled to ${-windowBounds.left},${-windowBounds.top}`
     );
 
+    emitProgress(opts.onProgress, context, ProgressPhase.CLONE, 10);
+
     perfMonitor.start('clone');
     const documentCloner = new DocumentCloner(context, element, cloneOptions);
     const clonedElement = documentCloner.clonedReferenceElement;
@@ -100,38 +131,39 @@ export const renderElement = async (
         throw new Error('Unable to find element in cloned iframe');
     }
 
-    const container = await documentCloner.toIFrame(ownerDocument, windowBounds);
-    perfMonitor.end('clone');
-
-    if (signal?.aborted) {
-        if (opts.removeContainer ?? true) {
-            DocumentCloner.destroy(container);
-        }
-        throwIfAborted(signal);
-    }
-
-    const { width, height, left, top } =
-        isBodyElement(clonedElement) || isHTMLElement(clonedElement)
-            ? parseDocumentSize(clonedElement.ownerDocument)
-            : parseBounds(context, clonedElement);
-
-    const backgroundColor = parseBackgroundColor(context, clonedElement, opts.backgroundColor);
-
-    const renderOptions: RenderConfigurations = assembleRenderOptions(
-        opts,
-        backgroundColor,
-        left,
-        top,
-        width,
-        height,
-        defaultView.devicePixelRatio ?? 1
-    );
-
-    let canvas;
-
+    // Declared outside the try so the cleanup below can reach the iframe when
+    // a render step after the successful mount throws. A mount REJECTION is
+    // cleaned up by the mount itself (iframe-mount removes the container it
+    // appended); from here on the reference exists and destroy() owns it.
+    let container: HTMLIFrameElement | undefined;
+    let canvas: HTMLCanvasElement;
     let root: ElementContainer | undefined;
 
     try {
+        container = await documentCloner.toIFrame(ownerDocument, windowBounds);
+        perfMonitor.end('clone');
+
+        emitProgress(opts.onProgress, context, ProgressPhase.CLONE, 30);
+
+        throwIfAborted(signal);
+
+        const { width, height, left, top } =
+            isBodyElement(clonedElement) || isHTMLElement(clonedElement)
+                ? parseDocumentSize(clonedElement.ownerDocument)
+                : parseBounds(context, clonedElement);
+
+        const backgroundColor = parseBackgroundColor(context, clonedElement, opts.backgroundColor);
+
+        const renderOptions: RenderConfigurations = assembleRenderOptions(
+            opts,
+            backgroundColor,
+            left,
+            top,
+            width,
+            height,
+            defaultView.devicePixelRatio ?? 1
+        );
+
         if (foreignObjectRendering) {
             context.logger.debug(`Document cloned, using foreign object rendering`);
             perfMonitor.start('render-foreignobject');
@@ -150,16 +182,36 @@ export const renderElement = async (
             // starting individual loads. This avoids serialised loading in
             // DOM-traversal order.
             context.cache.startDefer();
-            root = parseTree(context, clonedElement);
+            root = parseTree(context, clonedElement, { normalizeDom: opts.normalizeDom });
             perfMonitor.end('parse');
 
-            // Batch-preload all collected images in parallel before rendering.
+            emitProgress(opts.onProgress, context, ProgressPhase.PARSE, 50);
+
+            // Batch-preload all collected images in parallel before rendering,
+            // reporting progress across the 50→60 range. The abort signal
+            // stops the wait as soon as it fires instead of after the
+            // slowest batch's images settle.
             perfMonitor.start('preload');
-            await context.cache.preloadAll();
+            await context.cache.preloadAll(
+                10,
+                (loaded, total) => {
+                    emitProgress(
+                        opts.onProgress,
+                        context,
+                        ProgressPhase.PRELOAD,
+                        50 + Math.round((loaded / total) * 10)
+                    );
+                },
+                signal
+            );
             perfMonitor.end('preload');
 
+            // Element bounds and text layout were measured during parse; with
+            // image resources resolved the layout information is final.
+            emitProgress(opts.onProgress, context, ProgressPhase.LAYOUT, 60);
+
             if (backgroundColor === root.styles.backgroundColor) {
-                root.styles.backgroundColor = COLORS.TRANSPARENT;
+                root.styles.backgroundColor = TRANSPARENT_COLOR;
             }
 
             context.logger.debug(
@@ -173,25 +225,19 @@ export const renderElement = async (
             perfMonitor.end('render');
         }
 
-        perfMonitor.start('cleanup');
-        if (opts.removeContainer ?? true) {
-            if (!DocumentCloner.destroy(container)) {
-                context.logger.error(`Cannot detach cloned iframe as it is not in the DOM anymore`);
-            }
-        }
-        perfMonitor.end('cleanup');
-
-        perfMonitor.end('total');
-        context.logger.debug(`Finished rendering`);
-
-        if (performanceMonitoring) {
-            perfMonitor.logSummary();
-        }
-
-        return canvas;
+        emitProgress(opts.onProgress, context, ProgressPhase.RENDER, 90);
     } finally {
-        if (root) {
-            root.restoreTree();
+        perfMonitor.start('cleanup');
+        try {
+            if (root) root.restoreTree();
+        } finally {
+            if (container && (opts.removeContainer ?? true)) DocumentCloner.destroy(container);
+            perfMonitor.end('cleanup');
         }
     }
+    perfMonitor.end('total');
+    context.logger.debug(`Finished rendering`);
+    if (performanceMonitoring) perfMonitor.logSummary();
+    emitProgress(opts.onProgress, context, ProgressPhase.RENDER, 100);
+    return canvas;
 };

@@ -1,6 +1,5 @@
 import { Bounds } from '../css/layout/bounds';
 import {
-    isBodyElement,
     isCanvasElement,
     isCustomElement,
     isElementNode,
@@ -15,15 +14,21 @@ import {
     isVideoElement,
     canHavePseudoElements
 } from './node-type-guards';
-import { isIdentToken, nonFunctionArgSeparator } from '../css/syntax/parser';
-import { TokenType } from '../css/syntax/tokenizer';
-import { CounterState, createCounterText } from '../css/types/functions/counter';
-import { LIST_STYLE_TYPE, listStyleType } from '../css/property-descriptors/list-style-type';
-import { CSSParsedCounterDeclaration, CSSParsedPseudoDeclaration } from '../css/index';
-import { getQuote } from '../css/property-descriptors/quotes';
+import { CounterState } from '../css/types/functions/counter';
+import { CSSParsedCounterDeclaration } from '../css/index';
 import { Context } from '../core/context';
 import { DebuggerType, isDebugging } from '../core/debugger';
-import { IGNORE_ATTRIBUTE, SlotCloner } from './slot-cloner';
+import { SlotCloner } from './slot-cloner';
+import { copyCSSStyles } from './copy-css-styles';
+import { createAdoptedStylesElement } from './adopted-styles';
+import { PseudoContentResolver, PseudoElementType, createPseudoHideStyles } from './pseudo-content';
+
+import { mountCloneInIFrame } from './iframe-mount';
+
+// Re-exported for backwards compatibility: existing consumers import these
+// from the cloner module.
+export { copyCSSStyles } from './copy-css-styles';
+export { serializeDoctype } from './iframe-mount';
 
 export interface CloneOptions {
     ignoreElements?: (element: Element) => boolean;
@@ -43,15 +48,8 @@ export type CloneConfigurations = CloneOptions & {
     inlineImages: boolean;
     copyStyles: boolean;
     cspNonce?: string;
-};
-
-/**
- * Trusted Types factory (getPolicy / createPolicy) for document.write in strict CSP environments.
- * Used in toIFrame() when writing initial HTML to the cloned document.
- */
-type TrustedTypesFactory = {
-    getPolicy?: (name: string) => unknown;
-    createPolicy: (name: string, config: object) => unknown;
+    /** Aborting rejects the iframe mount instead of waiting out readiness windows. */
+    signal?: AbortSignal;
 };
 
 /**
@@ -82,8 +80,8 @@ export class DocumentCloner {
     clonedReferenceElement?: HTMLElement;
     private readonly documentElement: HTMLElement;
     private readonly counters: CounterState;
+    private readonly pseudoContents: PseudoContentResolver;
     private readonly slotCloner: SlotCloner;
-    private quoteDepth: number;
 
     constructor(
         private readonly context: Context,
@@ -93,10 +91,14 @@ export class DocumentCloner {
         this.scrolledElements = [];
         this.referenceElement = element;
         this.counters = new CounterState();
-        this.quoteDepth = 0;
+        this.pseudoContents = new PseudoContentResolver(context, this.counters);
         this.slotCloner = new SlotCloner(
             (node, copyStyles) => this.cloneNode(node, copyStyles),
-            { ignoreElements: options.ignoreElements, copyStyles: options.copyStyles ?? true },
+            {
+                ignoreElements: options.ignoreElements,
+                copyStyles: options.copyStyles ?? true,
+                cspNonce: options.cspNonce
+            },
             context
         );
         if (!element.ownerDocument) {
@@ -112,127 +114,64 @@ export class DocumentCloner {
         }
 
         this.documentElement = this.cloneNode(element.ownerDocument.documentElement, false) as HTMLElement;
+        this.appendDocumentAdoptedStyles(element.ownerDocument);
+        this.appendPseudoHideStyles();
+    }
+
+    /**
+     * Re-materialise the source document's constructable stylesheets
+     * (document.adoptedStyleSheets) as a <style> at the end of the clone's
+     * <head>: cloneNode never carries them, and they cascade after all author
+     * sheets, which appending last approximates.
+     *
+     * Skipped when computed styles are inlined per element (copyStyles), like
+     * the other stylesheet-cloning paths.
+     */
+    private appendDocumentAdoptedStyles(ownerDocument: Document): void {
+        if (this.options.copyStyles) {
+            return;
+        }
+        const sheets = ownerDocument.adoptedStyleSheets;
+        if (!sheets || sheets.length === 0) {
+            return;
+        }
+        const head = this.documentElement.getElementsByTagName('head').item(0);
+        if (!head) {
+            return;
+        }
+        // The clone subtree is still owned by the source document until
+        // adoptNode() runs in the iframe mount, so create the element there.
+        const style = createAdoptedStylesElement(
+            this.documentElement.ownerDocument ?? ownerDocument,
+            sheets,
+            this.options.cspNonce
+        );
+        if (style) {
+            head.appendChild(style);
+        }
+    }
+
+    /**
+     * Add the rules that hide the source ::before / ::after (the clone draws
+     * them as surrogate elements) to the clone's <head>. Inside <body> the
+     * <style> would be one of its children, and `body > :first-child`,
+     * `:nth-child()` and sibling selectors would match the wrong elements.
+     */
+    private appendPseudoHideStyles(): void {
+        const head = this.documentElement.getElementsByTagName('head').item(0);
+        createPseudoHideStyles(head ?? this.documentElement, this.options.cspNonce);
     }
 
     toIFrame(ownerDocument: Document, windowSize: Bounds): Promise<HTMLIFrameElement> {
-        const iframe: HTMLIFrameElement = createIFrameContainer(
-            ownerDocument,
-            windowSize,
-            this.options.iframeContainer
-        );
-
-        if (!iframe.contentWindow) {
-            throw new Error('Unable to find iframe window');
-        }
-
-        const scrollX = (ownerDocument.defaultView as Window).pageXOffset;
-        const scrollY = (ownerDocument.defaultView as Window).pageYOffset;
-
-        const cloneWindow = iframe.contentWindow;
-        const documentClone: Document = cloneWindow.document;
-
-        /* Chrome doesn't detect relative background-images assigned in inline <style> sheets when fetched through getComputedStyle
-         if window url is about:blank, we can assign the url to current by writing onto the document
-         */
-
-        const iframeLoad = iframeLoader(iframe).then(async () => {
-            this.scrolledElements.forEach(restoreNodeScroll);
-            if (cloneWindow) {
-                cloneWindow.scrollTo(windowSize.left, windowSize.top);
-            }
-
-            const onclone = this.options.onclone;
-
-            const referenceElement = this.clonedReferenceElement;
-
-            if (typeof referenceElement === 'undefined') {
-                throw new Error(`Error finding the ${this.referenceElement.nodeName} in the cloned document`);
-            }
-
-            if (documentClone.fonts && documentClone.fonts.ready) {
-                await documentClone.fonts.ready;
-            }
-
-            if (/(AppleWebKit)/g.test(navigator.userAgent)) {
-                await imagesReady(documentClone);
-            }
-
-            if (typeof onclone === 'function') {
-                await Promise.resolve().then(() => onclone(documentClone, referenceElement));
-            }
-
-            // onclone can change layout above the viewport and trigger browser scroll
-            // anchoring. Reapply the requested offset after the callback so element
-            // bounds stay aligned with the window bounds used by the renderer.
-            cloneWindow.scrollTo(windowSize.left, windowSize.top);
-            if (
-                /AppleWebKit/g.test(navigator.userAgent) &&
-                (cloneWindow.scrollY !== windowSize.top || cloneWindow.scrollX !== windowSize.left)
-            ) {
-                this.context.logger.warn('Unable to restore scroll position for cloned document');
-                this.context.windowBounds = this.context.windowBounds.add(
-                    cloneWindow.scrollX - windowSize.left,
-                    cloneWindow.scrollY - windowSize.top,
-                    0,
-                    0
-                );
-            }
-
-            return iframe;
+        return mountCloneInIFrame(this.context, ownerDocument, windowSize, {
+            documentElement: this.documentElement,
+            clonedReferenceElement: this.clonedReferenceElement,
+            referenceElementName: this.referenceElement.nodeName,
+            scrolledElements: this.scrolledElements,
+            onclone: this.options.onclone,
+            container: this.options.iframeContainer,
+            signal: this.options.signal
         });
-        /**
-         * The base URI used for resolving relative URLs (e.g. background-image) in the clone.
-         * Must come from the source document: the iframe document is about:blank, so
-         * documentClone.baseURI would break getComputedStyle() for relative background URLs.
-         */
-        const baseUri = ownerDocument.baseURI;
-        documentClone.open();
-        // rawHTML is always a static, internally-generated string:
-        // serializeDoctype(document.doctype) + '<html></html>'
-        // No user-controlled input — safe for document.write in the sandbox iframe.
-        const rawHTML = serializeDoctype(document.doctype) + '<html></html>';
-        try {
-            const ownerWindow = this.referenceElement.ownerDocument?.defaultView;
-            const trustedTypesFactory =
-                ownerWindow && (ownerWindow as Window & { trustedTypes?: TrustedTypesFactory }).trustedTypes;
-            let policy = trustedTypesFactory?.getPolicy?.('html2canvas-pro');
-            if (!policy && trustedTypesFactory) {
-                policy = trustedTypesFactory.createPolicy('html2canvas-pro', {
-                    createHTML: (s: string) => s
-                });
-            }
-            // Prefer Trusted Types when available; fallback is the same static HTML.
-            const html = policy ? (policy as { createHTML: (s: string) => string }).createHTML(rawHTML) : rawHTML;
-            // CodeQL:no - rawHTML is a static internal string, never user-controlled
-            documentClone.write(html as string);
-        } catch (_e) {
-            // CodeQL:no - rawHTML is a static internal string, never user-controlled
-            documentClone.write(rawHTML);
-        }
-        // Chrome scrolls the parent document for some reason after the write to the cloned window???
-        restoreOwnerScroll(this.referenceElement.ownerDocument, scrollX, scrollY);
-        /**
-         * IMPORTANT: documentClone.close() MUST be called BEFORE adoptNode().
-         *
-         * In Chrome, calling adoptNode() while the document is still "open"
-         * (between document.open() and document.close()) causes CSS rules with
-         * uppercase characters in class names (e.g. ".MyClass") to not match
-         * correctly. Chrome's CSS engine only enters a fully-resolved matching
-         * mode once the document is closed.
-         *
-         * Correct order: open() → write() → close() → adoptNode() → replaceChild()
-         *
-         * Timing: close() queues the iframe 'load' event; because JS is single-threaded,
-         * the synchronous adoptNode() and replaceChild() below complete before that
-         * event is dispatched. iframeLoader's setInterval will therefore see the body
-         * already populated on its first tick.
-         */
-        documentClone.close();
-        const adoptedNode = documentClone.adoptNode(this.documentElement);
-        addBase(adoptedNode, baseUri);
-        documentClone.replaceChild(adoptedNode, documentClone.documentElement);
-
-        return iframeLoad;
     }
 
     createElementClone<T extends HTMLElement | SVGElement>(node: T): HTMLElement | SVGElement {
@@ -281,8 +220,8 @@ export class DocumentCloner {
         // across TypeScript DOM lib versions (TS2488 on older libs).
         const attributes = clonedNode.attributes;
         for (let i = 0; i < attributes.length; i++) {
-            const attr = attributes[i];
-            if (attr.name !== 'class' && attr.name !== 'style') {
+            const attr = attributes.item(i);
+            if (attr && attr.name !== 'class' && attr.name !== 'style') {
                 clone.setAttribute(attr.name, attr.value);
             }
         }
@@ -329,7 +268,7 @@ export class DocumentCloner {
         } catch (e) {
             // accessing node.sheet.cssRules throws a DOMException
             this.context.logger.error('Unable to access cssRules property', e);
-            if (e.name !== 'SecurityError') {
+            if ((e as { name?: string }).name !== 'SecurityError') {
                 throw e;
             }
         }
@@ -424,7 +363,7 @@ export class DocumentCloner {
 
     cloneNode(node: Node, copyStyles: boolean): Node {
         if (isTextNode(node)) {
-            return document.createTextNode(node.data);
+            return (node.ownerDocument ?? document).createTextNode(node.data);
         }
 
         if (!node.ownerDocument) {
@@ -446,23 +385,19 @@ export class DocumentCloner {
             if (this.referenceElement === node && isHTMLElementNode(clone)) {
                 this.clonedReferenceElement = clone;
             }
-            if (isBodyElement(clone)) {
-                createPseudoHideStyles(clone, this.options.cspNonce);
-            }
 
             const counters = this.counters.parse(new CSSParsedCounterDeclaration(this.context, style));
 
             if (checkPseudoElements) {
                 const styleBefore = window.getComputedStyle(node, ':before');
-                const before = this.resolvePseudoContent(node, clone, styleBefore, PseudoElementType.BEFORE);
+                const before = this.pseudoContents.resolvePseudoContent(
+                    node,
+                    clone,
+                    styleBefore,
+                    PseudoElementType.BEFORE
+                );
                 if (before) {
                     clone.insertBefore(before, clone.firstChild);
-                }
-
-                const styleAfter = window.getComputedStyle(node, ':after');
-                const after = this.resolvePseudoContent(node, clone, styleAfter, PseudoElementType.AFTER);
-                if (after) {
-                    clone.appendChild(after);
                 }
             }
 
@@ -472,6 +407,23 @@ export class DocumentCloner {
 
             if (!isVideoElement(node)) {
                 this.cloneChildNodes(node, clone, copyStyles);
+            }
+
+            // ::after content must follow the element's children (CSS
+            // generated-content order). Resolving it before the children were
+            // cloned put it between ::before and the content, which also
+            // desynchronised the shared open-quote/close-quote depth.
+            if (checkPseudoElements) {
+                const styleAfter = window.getComputedStyle(node, ':after');
+                const after = this.pseudoContents.resolvePseudoContent(
+                    node,
+                    clone,
+                    styleAfter,
+                    PseudoElementType.AFTER
+                );
+                if (after) {
+                    clone.appendChild(after);
+                }
             }
 
             this.counters.pop(counters);
@@ -500,107 +452,6 @@ export class DocumentCloner {
         return node.cloneNode(false);
     }
 
-    resolvePseudoContent(
-        node: Element,
-        clone: Element,
-        style: CSSStyleDeclaration,
-        pseudoElt: PseudoElementType
-    ): HTMLElement | void {
-        if (!style) {
-            return;
-        }
-
-        const value = style.content;
-        const document = clone.ownerDocument;
-        if (!document || !value || value === 'none' || value === '-moz-alt-content' || style.display === 'none') {
-            return;
-        }
-
-        this.counters.parse(new CSSParsedCounterDeclaration(this.context, style));
-        const declaration = new CSSParsedPseudoDeclaration(this.context, style);
-
-        const anonymousReplacedElement = document.createElement('html2canvaspseudoelement');
-        copyCSSStyles(style, anonymousReplacedElement);
-
-        declaration.content.forEach((token) => {
-            if (token.type === TokenType.STRING_TOKEN) {
-                anonymousReplacedElement.appendChild(document.createTextNode(token.value));
-            } else if (token.type === TokenType.URL_TOKEN) {
-                const img = document.createElement('img');
-                img.src = token.value;
-                img.style.opacity = '1';
-                anonymousReplacedElement.appendChild(img);
-            } else if (token.type === TokenType.FUNCTION) {
-                if (token.name === 'attr') {
-                    const attr = token.values.filter(isIdentToken);
-                    if (attr.length) {
-                        anonymousReplacedElement.appendChild(
-                            document.createTextNode(node.getAttribute(attr[0].value) || '')
-                        );
-                    }
-                } else if (token.name === 'counter') {
-                    const [counter, counterStyle] = token.values.filter(nonFunctionArgSeparator);
-                    if (counter && isIdentToken(counter)) {
-                        const counterState = this.counters.getCounterValue(counter.value);
-                        const counterType =
-                            counterStyle && isIdentToken(counterStyle)
-                                ? listStyleType.parse(this.context, counterStyle.value)
-                                : LIST_STYLE_TYPE.DECIMAL;
-
-                        anonymousReplacedElement.appendChild(
-                            document.createTextNode(createCounterText(counterState, counterType, false))
-                        );
-                    }
-                } else if (token.name === 'counters') {
-                    const [counter, delim, counterStyle] = token.values.filter(nonFunctionArgSeparator);
-                    if (counter && isIdentToken(counter)) {
-                        const counterStates = this.counters.getCounterValues(counter.value);
-                        const counterType =
-                            counterStyle && isIdentToken(counterStyle)
-                                ? listStyleType.parse(this.context, counterStyle.value)
-                                : LIST_STYLE_TYPE.DECIMAL;
-                        const separator = delim && delim.type === TokenType.STRING_TOKEN ? delim.value : '';
-                        const text = counterStates
-                            .map((value) => createCounterText(value, counterType, false))
-                            .join(separator);
-
-                        anonymousReplacedElement.appendChild(document.createTextNode(text));
-                    }
-                }
-            } else if (token.type === TokenType.IDENT_TOKEN) {
-                switch (token.value) {
-                    case 'open-quote':
-                        anonymousReplacedElement.appendChild(
-                            document.createTextNode(getQuote(declaration.quotes, this.quoteDepth++, true))
-                        );
-                        break;
-                    case 'close-quote':
-                        anonymousReplacedElement.appendChild(
-                            document.createTextNode(getQuote(declaration.quotes, --this.quoteDepth, false))
-                        );
-                        break;
-                    default:
-                        // safari doesn't parse string tokens correctly because of lack of quotes
-                        anonymousReplacedElement.appendChild(document.createTextNode(token.value));
-                }
-            }
-        });
-
-        anonymousReplacedElement.className = `${PSEUDO_HIDE_ELEMENT_CLASS_BEFORE} ${PSEUDO_HIDE_ELEMENT_CLASS_AFTER}`;
-        const newClassName =
-            pseudoElt === PseudoElementType.BEFORE
-                ? ` ${PSEUDO_HIDE_ELEMENT_CLASS_BEFORE}`
-                : ` ${PSEUDO_HIDE_ELEMENT_CLASS_AFTER}`;
-
-        if (isSVGElementNode(clone)) {
-            clone.className.baseValue += newClassName;
-        } else {
-            clone.className += newClassName;
-        }
-
-        return anonymousReplacedElement;
-    }
-
     static destroy(container: HTMLIFrameElement): boolean {
         if (container.parentNode) {
             container.parentNode.removeChild(container);
@@ -609,185 +460,3 @@ export class DocumentCloner {
         return false;
     }
 }
-
-enum PseudoElementType {
-    BEFORE,
-    AFTER
-}
-
-const createIFrameContainer = (
-    ownerDocument: Document,
-    bounds: Bounds,
-    customContainer?: HTMLElement | ShadowRoot
-): HTMLIFrameElement => {
-    const cloneIframeContainer = ownerDocument.createElement('iframe');
-
-    cloneIframeContainer.className = 'html2canvas-container';
-    cloneIframeContainer.style.visibility = 'hidden';
-    cloneIframeContainer.style.position = 'fixed';
-    cloneIframeContainer.style.left = '-10000px';
-    cloneIframeContainer.style.top = '0px';
-    cloneIframeContainer.style.border = '0';
-    cloneIframeContainer.width = bounds.width.toString();
-    cloneIframeContainer.height = bounds.height.toString();
-    cloneIframeContainer.scrolling = 'no'; // ios won't scroll without it
-    cloneIframeContainer.setAttribute(IGNORE_ATTRIBUTE, 'true');
-
-    // Use custom container if provided, otherwise use body
-    const container = customContainer || ownerDocument.body;
-    container.appendChild(cloneIframeContainer);
-
-    return cloneIframeContainer;
-};
-
-const imageReady = (img: HTMLImageElement): Promise<Event | void | string> => {
-    return new Promise((resolve) => {
-        if (img.complete) {
-            resolve();
-            return;
-        }
-        if (!img.src) {
-            resolve();
-            return;
-        }
-        img.onload = resolve;
-        img.onerror = resolve;
-    });
-};
-
-const imagesReady = (document: HTMLDocument): Promise<unknown[]> => {
-    return Promise.all([].slice.call(document.images, 0).map(imageReady));
-};
-
-const iframeLoader = (iframe: HTMLIFrameElement): Promise<HTMLIFrameElement> => {
-    return new Promise((resolve, reject) => {
-        const cloneWindow = iframe.contentWindow;
-
-        if (!cloneWindow) {
-            return reject(`No window assigned for iframe`);
-        }
-
-        const documentClone = cloneWindow.document;
-
-        cloneWindow.onload = iframe.onload = () => {
-            cloneWindow.onload = iframe.onload = null;
-            const MAX_POLL_ATTEMPTS = 600; // 30 seconds at 50ms intervals
-            let attempts = 0;
-            const interval = setInterval(() => {
-                attempts++;
-                if (documentClone.body.childNodes.length > 0 && documentClone.readyState === 'complete') {
-                    clearInterval(interval);
-                    resolve(iframe);
-                } else if (attempts >= MAX_POLL_ATTEMPTS) {
-                    clearInterval(interval);
-                    resolve(iframe); // resolve anyway to avoid hanging
-                }
-            }, 50);
-        };
-    });
-};
-
-const ignoredStyleProperties = [
-    'all', // #2476
-    'd', // #2483
-    'content' // Safari shows pseudoelements if content is set
-];
-
-export const copyCSSStyles = <T extends HTMLElement | SVGElement>(style: CSSStyleDeclaration, target: T): T => {
-    const parts: string[] = [];
-    for (let i = style.length - 1; i >= 0; i--) {
-        const property = style.item(i);
-        // fix: Chrome_138 ignore custom properties
-        if (ignoredStyleProperties.indexOf(property) === -1 && !property.startsWith('--')) {
-            const value = style.getPropertyValue(property);
-            if (value) {
-                const priority = style.getPropertyPriority(property);
-                parts.push(priority ? `${property}:${value} !${priority}` : `${property}:${value}`);
-            }
-        }
-    }
-    if (parts.length > 0) {
-        target.style.cssText = parts.join(';') + ';';
-    }
-    return target;
-};
-
-/**
- * Serialise a document type declaration to an HTML string.
- * @internal – exported for testing only, not part of the public API.
- */
-export const serializeDoctype = (doctype?: DocumentType | null): string => {
-    let str = '';
-    if (doctype) {
-        str += '<!DOCTYPE ';
-        if (doctype.name) {
-            str += doctype.name;
-        }
-        if (doctype.internalSubset) {
-            str += ' ' + doctype.internalSubset.replace(/"/g, '&quot;').replace(/>/g, '&gt;');
-        }
-        if (doctype.publicId) {
-            str += ' PUBLIC "' + doctype.publicId.replace(/"/g, '&quot;') + '"';
-            if (doctype.systemId) {
-                str += ' "' + doctype.systemId.replace(/"/g, '&quot;') + '"';
-            }
-        } else if (doctype.systemId) {
-            str += ' SYSTEM "' + doctype.systemId.replace(/"/g, '&quot;') + '"';
-        }
-        str += '>';
-    }
-    return str;
-};
-
-const restoreOwnerScroll = (ownerDocument: Document | null, x: number, y: number) => {
-    if (
-        ownerDocument &&
-        ownerDocument.defaultView &&
-        (x !== ownerDocument.defaultView.pageXOffset || y !== ownerDocument.defaultView.pageYOffset)
-    ) {
-        ownerDocument.defaultView.scrollTo(x, y);
-    }
-};
-
-const restoreNodeScroll = ([element, x, y]: [HTMLElement, number, number]) => {
-    element.scrollLeft = x;
-    element.scrollTop = y;
-};
-
-const PSEUDO_BEFORE = ':before';
-const PSEUDO_AFTER = ':after';
-const PSEUDO_HIDE_ELEMENT_CLASS_BEFORE = '___html2canvas___pseudoelement_before';
-const PSEUDO_HIDE_ELEMENT_CLASS_AFTER = '___html2canvas___pseudoelement_after';
-
-const PSEUDO_HIDE_ELEMENT_STYLE = `{
-    content: "" !important;
-    display: none !important;
-}`;
-
-const createPseudoHideStyles = (body: HTMLElement, cspNonce?: string) => {
-    createStyles(
-        body,
-        `.${PSEUDO_HIDE_ELEMENT_CLASS_BEFORE}${PSEUDO_BEFORE}${PSEUDO_HIDE_ELEMENT_STYLE}
-         .${PSEUDO_HIDE_ELEMENT_CLASS_AFTER}${PSEUDO_AFTER}${PSEUDO_HIDE_ELEMENT_STYLE}`,
-        cspNonce
-    );
-};
-
-const createStyles = (body: HTMLElement, styles: string, cspNonce?: string) => {
-    const document = body.ownerDocument;
-    if (document) {
-        const style = document.createElement('style');
-        style.textContent = styles;
-        if (cspNonce) {
-            style.nonce = cspNonce;
-        }
-        body.appendChild(style);
-    }
-};
-
-const addBase = (targetELement: HTMLElement, baseUri: string) => {
-    const baseNode = targetELement.ownerDocument.createElement('base');
-    baseNode.href = baseUri;
-    const headEle = targetELement.getElementsByTagName('head').item(0);
-    headEle?.insertBefore(baseNode, headEle?.firstChild ?? null);
-};

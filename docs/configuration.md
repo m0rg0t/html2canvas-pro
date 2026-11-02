@@ -67,6 +67,7 @@ Options that control how images are processed and loaded.
 | imageSmoothing | `true` | Whether to apply smoothing to images. Set to `false` for pixel-perfect rendering of pixel art, sprites, and low-res images. Also respects CSS `image-rendering` property | `false` |
 | imageSmoothingQuality | browser default | Quality level for image smoothing when `imageSmoothing` is enabled: `'low'`, `'medium'`, or `'high'`. Higher quality may be slower for large images | `'high'` |
 | imageTimeout | `15000` | Timeout for loading an image (in milliseconds). Set to `0` to disable timeout | `30000` |
+| maxCacheSize | `100` | Maximum number of image resources kept in the internal LRU cache (max `10000`). Eviction is suspended while a render preloads its own images, so pages with more unique images than the cap still capture every picture | `500` |
 | proxy | `null` | Url to the [proxy](./proxy) which is to be used for loading cross-origin images. If left empty, cross-origin images won't be loaded | `"https://proxy.example.com/"` |
 | useCORS | `false` | Whether to attempt to load images from a server using CORS | `true` |
 
@@ -76,10 +77,10 @@ Options that control how the content is rendered to the canvas.
 
 | Option Name | Default | Description | Example |
 | ----------- | :-----: | ----------- | ------- |
-| foreignObjectRendering | `false` | Whether to use ForeignObject rendering if the browser supports it | `true` |
+| foreignObjectRendering | `false` | **Experimental.** Use the SVG foreignObject pipeline instead of the default Canvas 2D renderer. Bypasses html2canvas-pro's own CSS rendering work and cannot abort mid-render; only prefer it for legacy Safari workarounds | `true` |
 | ignoreElements | `(element) => false` | Predicate function which removes the matching elements from the render | `(el) => el.classList.contains('no-capture')` |
 | iframeContainer | `null` | Custom parent node for the temporary iframe container. Useful for Shadow DOM scenarios. If not provided, will auto-detect Shadow Root or use `document.body` | `document.querySelector('#my-shadow-host').shadowRoot` |
-| onclone | `null` | Callback function which is called when the Document has been cloned for rendering, can be used to modify the contents that will be rendered without affecting the original source document | `(doc) => doc.querySelector('.date').textContent = new Date().toISOString()` |
+| onclone | `null` | Callback function which is called when the Document has been cloned for rendering, can be used to modify the contents that will be rendered without affecting the original source document. Since v2.5.3 the callback runs **after the clone's external stylesheets, web fonts and (on WebKit) images have finished loading**, so computed styles queried inside the callback reflect the final layout | `(doc) => doc.querySelector('.date').textContent = new Date().toISOString()` |
 | x | `Element` x-offset | Crop canvas x-coordinate | `10` |
 | y | `Element` y-offset | Crop canvas y-coordinate | `20` |
 | scrollX | `Element` scrollX | The x-scroll position to use when rendering element (for example if the Element uses `position: fixed`) | `0` |
@@ -103,10 +104,60 @@ If you wish to exclude certain `Element`s from getting rendered, you can add a `
 | Option Name | Default | Description | Example |
 | ----------- | :-----: | ----------- | ------- |
 | cspNonce | `null` | Content-Security-Policy nonce for inline styles | `"abc123"` |
+| normalizeDom | `true` | Normalize the cloned DOM before capture (disable animations, replace active transforms with identity values while measuring). Set to `false` to preserve the original DOM state | `false` |
 | skipValidation | `false` | Skip the built-in input validation (not recommended) | `true` |
-| enablePerformanceMonitoring | `false` | Enable performance metrics collection. Access via `PerformanceMonitor` | `true` |
+| enablePerformanceMonitoring | `false` | Enable performance metrics collection and log a timing summary. Defaults to the `logging` option value when not specified | `true` |
 | signal | `null` | `AbortSignal` to cancel an in-progress render | `new AbortController().signal` |
 | validator | `default` | Custom `Validator` instance for input validation | `createStrictValidator(['proxy.example.com'])` |
+
+### Error Handling & Cancellation
+
+Use `onError` to observe failed resources and `signal` to cancel an in-progress render:
+
+```javascript
+const controller = new AbortController();
+
+html2canvas(element, {
+    onError: (error) => {
+        // A resource (image, font, …) failed to load. Image and proxy
+        // failures are reported exactly once, by the resource cache at
+        // load time. The render continues — this is a notification hook,
+        // not an abort.
+        console.warn('Resource failed:', error);
+    },
+    signal: controller.signal
+}).then(canvas => {
+    document.body.appendChild(canvas);
+});
+
+// Cancel the in-progress capture; the promise rejects with an `AbortError`.
+// Aborting is honoured while cloning (iframe readiness) and while preloading
+// images, not only between pipeline phases.
+controller.abort();
+```
+
+### Progress Callback
+
+Subscribe to pipeline milestones with `onProgress`:
+
+```javascript
+import html2canvas from 'html2canvas-pro';
+
+html2canvas(element, {
+    onProgress: (phase, progress) => {
+        console.log(`${phase}: ${progress}%`);
+        // clone 10 → clone 30 → parse 50 →
+        // preload 50…60 (one event per settled image batch) →
+        // layout 60 → render 90 → render 100
+    }
+});
+```
+
+`phase` is one of `'clone'`, `'parse'`, `'preload'`, `'layout'` or `'render'`;
+`progress` is a coarse 0–100 estimate. Image preloading reports one event per
+settled batch across the 50–60 range, so captures with many images show
+incremental progress. Callback exceptions are caught and logged — a broken
+handler never fails the capture.
 
 ### CSP Nonce
 
@@ -183,6 +234,8 @@ html2canvas(element, {
 ## Shadow DOM Support
 
 The `iframeContainer` option allows you to specify where the temporary iframe should be created. This is particularly useful when rendering elements inside Shadow DOM, as styles defined within the Shadow Root need to be accessible to the cloned content.
+
+Constructable stylesheets are cloned as well: `adoptedStyleSheets` attached to a Shadow Root (Lit, React and other frameworks inject component styles this way) or to the document are serialized into a `<style>` element inside the clone, so captures no longer depend on the sheets being part of the node tree.
 
 ### Automatic Detection
 

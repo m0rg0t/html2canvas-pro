@@ -4,6 +4,7 @@
  */
 
 import { strictEqual, ok } from 'assert';
+import type { CSSParsedDeclaration } from '../../../css';
 import { TextRenderer, TextRendererDependencies } from '../text-renderer';
 import { Bounds } from '../../../css/layout/bounds';
 import { TextBounds } from '../../../css/layout/text';
@@ -29,7 +30,7 @@ describe('TextRenderer Edge Cases', () => {
             direction: 'ltr' as CanvasDirection,
             textAlign: 'left' as CanvasTextAlign,
             fillText() {},
-            measureText(text: string) {
+            measureText() {
                 return {
                     width: opts.width ?? 30,
                     fontBoundingBoxAscent: opts.fontBoundingBoxAscent ?? 14,
@@ -58,28 +59,29 @@ describe('TextRenderer Edge Cases', () => {
         return new TextRenderer(deps);
     };
 
-    const createMockStyles = (overrides: Record<string, unknown> = {}) => ({
-        fontFamily: ['Arial'],
-        fontSize: { number: 16, unit: 'px' },
-        fontStyle: 'normal',
-        fontVariant: [],
-        fontWeight: 'normal',
-        color: { r: 0, g: 0, b: 0, a: 1 },
-        letterSpacing: 0,
-        webkitTextStrokeWidth: 0,
-        textShadow: [],
-        textDecorationLine: [],
-        paintOrder: [PAINT_ORDER_LAYER.FILL],
-        direction: DIRECTION.LTR,
-        writingMode: WRITING_MODE.HORIZONTAL_TB,
-        display: DISPLAY.BLOCK,
-        webkitLineClamp: 0,
-        textOverflow: TEXT_OVERFLOW.CLIP,
-        overflowX: OVERFLOW.VISIBLE,
-        overflowY: OVERFLOW.VISIBLE,
-        lineHeight: { value: 1.2, type: 1 },
-        ...overrides
-    });
+    const createMockStyles = (overrides: Record<string, unknown> = {}) =>
+        ({
+            fontFamily: ['Arial'],
+            fontSize: { number: 16, unit: 'px' },
+            fontStyle: 'normal',
+            fontVariant: [],
+            fontWeight: 'normal',
+            color: { r: 0, g: 0, b: 0, a: 1 },
+            letterSpacing: 0,
+            webkitTextStrokeWidth: 0,
+            textShadow: [],
+            textDecorationLine: [],
+            paintOrder: [PAINT_ORDER_LAYER.FILL],
+            direction: DIRECTION.LTR,
+            writingMode: WRITING_MODE.HORIZONTAL_TB,
+            display: DISPLAY.BLOCK,
+            webkitLineClamp: 0,
+            textOverflow: TEXT_OVERFLOW.CLIP,
+            overflowX: OVERFLOW.VISIBLE,
+            overflowY: OVERFLOW.VISIBLE,
+            lineHeight: { value: 1.2, type: 1 },
+            ...overrides
+        }) as unknown as CSSParsedDeclaration;
 
     describe('NaN and Invalid Metrics', () => {
         it('should handle NaN actualBoundingBoxAscent', async () => {
@@ -124,8 +126,8 @@ describe('TextRenderer Edge Cases', () => {
 
             // NaN ?? number returns number
             strictEqual(fillCalls.length, 1);
-            strictEqual(fillCalls[0].y, 66); // 50 + 16 (fontSize fallback)
-            ok(!Number.isNaN(fillCalls[0].y), 'y should not be NaN');
+            strictEqual(fillCalls[0]?.y, 66); // 50 + 16 (fontSize fallback)
+            ok(!Number.isNaN(fillCalls[0]?.y), 'y should not be NaN');
         });
 
         it('should handle negative actualBoundingBoxAscent', async () => {
@@ -169,7 +171,7 @@ describe('TextRenderer Edge Cases', () => {
 
             strictEqual(fillCalls.length, 1);
             // Negative value is used as-is (not falsy)
-            strictEqual(fillCalls[0].y, 45); // 50 + (-5)
+            strictEqual(fillCalls[0]?.y, 45); // 50 + (-5)
         });
 
         it('should handle Infinity actualBoundingBoxAscent', async () => {
@@ -213,7 +215,7 @@ describe('TextRenderer Edge Cases', () => {
 
             strictEqual(fillCalls.length, 1);
             // Infinity is used as-is (not falsy)
-            strictEqual(fillCalls[0].y, Infinity);
+            strictEqual(fillCalls[0]?.y, Infinity);
         });
     });
 
@@ -354,7 +356,7 @@ describe('TextRenderer Edge Cases', () => {
 
             strictEqual(fillCalls.length, 1);
             // Baseline should not be scaled (it's relative to font size, not canvas scale)
-            strictEqual(fillCalls[0].y, 64); // 50 + 14
+            strictEqual(fillCalls[0]?.y, 64); // 50 + 14
         });
     });
 
@@ -379,7 +381,7 @@ describe('TextRenderer Edge Cases', () => {
             await renderer.renderTextNode(textContainer, createMockStyles());
 
             strictEqual(fillCalls.length, 1);
-            strictEqual(fillCalls[0].text, 'Hello 😀 World');
+            strictEqual(fillCalls[0]?.text, 'Hello 😀 World');
         });
 
         it('should handle zero-width joiner', async () => {

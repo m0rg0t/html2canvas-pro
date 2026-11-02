@@ -164,4 +164,122 @@ describe('DOMNormalizer', () => {
         const emptyStyles: OriginalStyles = {};
         expect(() => DOMNormalizer.restoreElement(mockElement as Element, emptyStyles)).not.toThrow();
     });
+
+    describe('outer <svg> elements (issue #244)', () => {
+        // isSVGElementNode detects SVG by className being an SVGAnimatedString
+        // object; the mock mimics that shape.
+        const makeSvgElement = (): Element =>
+            ({
+                nodeType: 1,
+                tagName: 'svg',
+                className: { baseVal: '', animVal: '' },
+                style: {
+                    animationDuration: '1s',
+                    transform: 'matrix(-1, 0, 0, -1, 0, 0)'
+                }
+            }) as unknown as Element;
+
+        it('normalizes the transform of an outer svg element', () => {
+            const svg = makeSvgElement();
+            const styles = new CSSParsedDeclaration(context, {
+                animationDuration: '0s',
+                transform: 'matrix(-1, 0, 0, -1, 0, 0)',
+                rotate: null
+            } as any);
+
+            const original = DOMNormalizer.normalizeElement(svg, styles);
+
+            strictEqual(svg.style.transform, 'translate(0, 0)');
+            strictEqual(original.transform, 'matrix(-1, 0, 0, -1, 0, 0)');
+        });
+
+        it('restores the original svg transform', () => {
+            const svg = makeSvgElement();
+            const styles = new CSSParsedDeclaration(context, {
+                animationDuration: '0s',
+                transform: 'matrix(-1, 0, 0, -1, 0, 0)',
+                rotate: null
+            } as any);
+
+            const original = DOMNormalizer.normalizeElement(svg, styles);
+            DOMNormalizer.restoreElement(svg, original);
+
+            strictEqual(svg.style.transform, 'matrix(-1, 0, 0, -1, 0, 0)');
+        });
+
+        it('neutralizes svg animations alongside the transform', () => {
+            const svg = makeSvgElement();
+            const styles = new CSSParsedDeclaration(context, {
+                animationDuration: '2s',
+                transform: 'matrix(-1, 0, 0, -1, 0, 0)',
+                rotate: null
+            } as any);
+
+            DOMNormalizer.normalizeElement(svg, styles);
+
+            strictEqual(svg.style.animationDuration, '0s');
+        });
+    });
+});
+
+describe('DOMNormalizer translate/scale normalization', () => {
+    const makeContext = (): Context => {
+        const mockWindow = {
+            document: {
+                createElement: (_name: string) => ({})
+            },
+            location: { href: 'http://localhost/' },
+            getComputedStyle: () => ({})
+        } as unknown as Window;
+        return new Context(
+            { logging: false, imageTimeout: 15000, useCORS: false, allowTaint: false },
+            new Bounds(0, 0, 800, 600),
+            new Html2CanvasConfig({ window: mockWindow })
+        );
+    };
+
+    const makeElement = (inlineStyle: Record<string, string>): HTMLElement =>
+        ({ nodeType: 1, tagName: 'DIV', style: { transform: '', ...inlineStyle } }) as unknown as HTMLElement;
+
+    it('neutralizes translate with its identity value and forces the containing block', () => {
+        const el = makeElement({ translate: '30px' });
+        const styles = new CSSParsedDeclaration(makeContext(), { translate: '30px' } as never);
+
+        const original = DOMNormalizer.normalizeElement(el, styles);
+
+        expect(el.style.translate).toBe('0px');
+        expect(el.style.transform).toBe('translate(0, 0)');
+        DOMNormalizer.restoreElement(el, original);
+        expect(el.style.translate).toBe('30px');
+        expect(el.style.transform).toBe('');
+    });
+
+    it('neutralizes scale with its identity value', () => {
+        const el = makeElement({ scale: '2' });
+        const styles = new CSSParsedDeclaration(makeContext(), { scale: '2' } as never);
+
+        const original = DOMNormalizer.normalizeElement(el, styles);
+
+        expect(el.style.scale).toBe('1');
+        expect(el.style.transform).toBe('translate(0, 0)');
+        DOMNormalizer.restoreElement(el, original);
+        expect(el.style.scale).toBe('2');
+        expect(el.style.transform).toBe('');
+    });
+
+    it('leaves an existing transform override in place when transform is also active', () => {
+        const el = makeElement({ transform: 'rotate(10deg)', translate: '5px' });
+        const styles = new CSSParsedDeclaration(makeContext(), {
+            transform: 'rotate(10deg)',
+            translate: '5px'
+        } as never);
+
+        const original = DOMNormalizer.normalizeElement(el, styles);
+
+        expect(el.style.transform).toBe('translate(0, 0)');
+        expect(el.style.translate).toBe('0px');
+        DOMNormalizer.restoreElement(el, original);
+        expect(el.style.transform).toBe('rotate(10deg)');
+        expect(el.style.translate).toBe('5px');
+    });
 });

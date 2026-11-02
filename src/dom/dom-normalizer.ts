@@ -5,7 +5,7 @@
  */
 
 import { CSSParsedDeclaration } from '../css';
-import { isHTMLElementNode } from './node-type-guards';
+import { isHTMLElementNode, isSVGElementNode } from './node-type-guards';
 
 /**
  * Stored original styles for restoration
@@ -14,6 +14,8 @@ export interface OriginalStyles {
     animationDuration?: string;
     transform?: string;
     rotate?: string;
+    translate?: string;
+    scale?: string;
 }
 
 /**
@@ -58,7 +60,13 @@ export class DOMNormalizer {
     static normalizeElement(element: Element, styles: CSSParsedDeclaration): OriginalStyles {
         const originalStyles: OriginalStyles = {};
 
-        if (!isHTMLElementNode(element)) {
+        // Both HTML and SVG containers measure the same way: neutralise the
+        // transform before parseBounds so getBoundingClientRect returns
+        // layout-space coordinates and the paint-time TransformEffect applies
+        // the transform exactly once. SVG elements implement
+        // ElementCSSInlineStyle, so element.style works for them too; skipping
+        // them double-applied outer <svg> transforms (issue #244).
+        if (!isHTMLElementNode(element) && !isSVGElementNode(element)) {
             return originalStyles;
         }
 
@@ -78,30 +86,40 @@ export class DOMNormalizer {
             element.style.transform = 'translate(0, 0)';
         }
 
-        // Same rationale for the standalone `rotate` property.
-        // `rotate: 0deg` is an identity rotation with no visual effect.
-        //
-        // However, individual transform properties (`rotate`, `translate`, `scale`)
-        // are part of CSS Transforms Level 2 and their containing-block guarantee
-        // is not uniformly implemented across all browsers. To be safe, if `rotate`
-        // is the only transform-like property active on this element, we also set
-        // `transform: translate(0, 0)` so that the containing-block role is reliably
-        // preserved via the well-supported `transform` property.
+        // The individual transform properties get the same treatment with
+        // their own identity values:
+        //   rotate: 45deg → 0deg, translate: 10px → 0px, scale: 2 → 1.
+        // Identity (≠ none) keeps the containing-block role where the browser
+        // honors the individual properties.
+        let needsContainingBlockFallback = false;
+
         if (styles.rotate !== null) {
             originalStyles.rotate = element.style.rotate;
             element.style.rotate = '0deg';
+            needsContainingBlockFallback = true;
+        }
 
-            // Individual transform properties (`rotate`, `translate`, `scale`) are
-            // CSS Transforms Level 2 and their containing-block guarantee is not
-            // uniformly implemented in all browsers. If `transform` was not already
-            // set to translate(0,0) in the block above (i.e. this element has
-            // `rotate` but no `transform`), we set it now so the containing-block
-            // role is reliably established via the widely-supported `transform`
-            // property – independently of browser support for individual props.
-            if (originalStyles.transform === undefined) {
-                originalStyles.transform = element.style.transform;
-                element.style.transform = 'translate(0, 0)';
-            }
+        if (styles.translate !== null) {
+            originalStyles.translate = element.style.translate;
+            element.style.translate = '0px';
+            needsContainingBlockFallback = true;
+        }
+
+        if (styles.scale !== null) {
+            originalStyles.scale = element.style.scale;
+            element.style.scale = '1';
+            needsContainingBlockFallback = true;
+        }
+
+        // Individual transform properties are CSS Transforms Level 2 and their
+        // containing-block guarantee is not uniformly implemented across all
+        // browsers. When any of them was the only transform-like property on
+        // this element, also set `transform: translate(0, 0)` so the
+        // containing-block role is reliably established via the well-supported
+        // `transform` property.
+        if (needsContainingBlockFallback && originalStyles.transform === undefined) {
+            originalStyles.transform = element.style.transform;
+            element.style.transform = 'translate(0, 0)';
         }
 
         return originalStyles;
@@ -114,7 +132,7 @@ export class DOMNormalizer {
      * @param originalStyles - Original styles to restore
      */
     static restoreElement(element: Element, originalStyles: OriginalStyles): void {
-        if (!isHTMLElementNode(element)) {
+        if (!isHTMLElementNode(element) && !isSVGElementNode(element)) {
             return;
         }
 
@@ -128,6 +146,14 @@ export class DOMNormalizer {
 
         if (originalStyles.rotate !== undefined) {
             element.style.rotate = originalStyles.rotate;
+        }
+
+        if (originalStyles.translate !== undefined) {
+            element.style.translate = originalStyles.translate;
+        }
+
+        if (originalStyles.scale !== undefined) {
+            element.style.scale = originalStyles.scale;
         }
     }
 }

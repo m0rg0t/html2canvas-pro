@@ -1,7 +1,4 @@
-import { OVERFLOW_WRAP } from '../property-descriptors/overflow-wrap';
 import { CSSParsedDeclaration } from '../index';
-import { fromCodePoint, LineBreaker, toCodePoints } from 'css-line-break';
-import { splitGraphemes } from 'text-segmentation';
 import { Bounds, parseBounds } from './bounds';
 import { FEATURES } from '../../core/features';
 import { Context } from '../../core/context';
@@ -92,32 +89,30 @@ const createRange = (node: Text, offset: number, length: number): Range => {
     return range;
 };
 
-export const segmentGraphemes = (value: string): string[] => {
-    if (FEATURES.SUPPORT_NATIVE_TEXT_SEGMENTATION) {
-        // Intl.Segmenter is TC39 Stage 4 but not yet in TS lib types
+// Segmenter construction is expensive and segmentation is locale-independent
+// for our use, so one instance per granularity is created and reused for
+// every text node of every render. Intl.Segmenter (Baseline since 2022)
+// replaced the css-line-break / text-segmentation fallbacks.
+const segmenterCache = new Map<'grapheme' | 'word', Intl.Segmenter>();
 
-        const Segmenter = Intl as unknown as {
-            Segmenter: new (l?: unknown, o?: object) => { segment(v: string): Iterable<{ segment: string }> };
-        };
-        const seg = new Segmenter.Segmenter(void 0, { granularity: 'grapheme' });
-
-        return Array.from(seg.segment(value)).map((s) => s.segment);
+const getSegmenter = (granularity: 'grapheme' | 'word'): Intl.Segmenter => {
+    let segmenter = segmenterCache.get(granularity);
+    if (!segmenter) {
+        segmenter = new Intl.Segmenter(undefined, { granularity });
+        segmenterCache.set(granularity, segmenter);
     }
-
-    return splitGraphemes(value);
+    return segmenter;
 };
 
-const segmentWords = (value: string, styles: CSSParsedDeclaration): string[] => {
-    if (FEATURES.SUPPORT_NATIVE_TEXT_SEGMENTATION) {
-        const Segmenter = Intl as unknown as {
-            Segmenter: new (l?: unknown, o?: object) => { segment(v: string): Iterable<{ segment: string }> };
-        };
-        const seg = new Segmenter.Segmenter(void 0, { granularity: 'word' });
+export const segmentGraphemes = (value: string): string[] =>
+    Array.from(getSegmenter('grapheme').segment(value), (s) => s.segment);
 
-        return Array.from(seg.segment(value)).map((s) => s.segment);
-    }
-
-    return breakWords(value, styles);
+const segmentWords = (value: string): string[] => {
+    // Intl.Segmenter's word granularity splits words and whitespace into
+    // separate segments; parseTextBounds measures each segment independently,
+    // which matches the previous LineBreaker + word-separator pipeline's
+    // per-fragment measurement.
+    return Array.from(getSegmenter('word').segment(value), (s) => s.segment);
 };
 
 const breakText = (value: string, styles: CSSParsedDeclaration): string[] => {
@@ -125,43 +120,5 @@ const breakText = (value: string, styles: CSSParsedDeclaration): string[] => {
         return segmentGraphemes(value);
     }
 
-    return styles.letterSpacing !== 0 ? segmentGraphemes(value) : segmentWords(value, styles);
-};
-
-// https://drafts.csswg.org/css-text/#word-separator
-const wordSeparators = [0x0020, 0x00a0, 0x1361, 0x10100, 0x10101, 0x1039, 0x1091];
-
-const breakWords = (str: string, styles: CSSParsedDeclaration): string[] => {
-    const breaker = LineBreaker(str, {
-        lineBreak: styles.lineBreak,
-        wordBreak: styles.overflowWrap === OVERFLOW_WRAP.BREAK_WORD ? 'break-word' : styles.wordBreak
-    });
-
-    const words = [];
-    let bk;
-
-    while (!(bk = breaker.next()).done) {
-        if (bk.value) {
-            const value = bk.value.slice();
-            const codePoints = toCodePoints(value);
-            let word = '';
-            codePoints.forEach((codePoint) => {
-                if (wordSeparators.indexOf(codePoint) === -1) {
-                    word += fromCodePoint(codePoint);
-                } else {
-                    if (word.length) {
-                        words.push(word);
-                    }
-                    words.push(fromCodePoint(codePoint));
-                    word = '';
-                }
-            });
-
-            if (word.length) {
-                words.push(word);
-            }
-        }
-    }
-
-    return words;
+    return styles.letterSpacing !== 0 ? segmentGraphemes(value) : segmentWords(value);
 };

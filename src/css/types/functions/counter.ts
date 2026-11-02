@@ -1,5 +1,5 @@
 import { LIST_STYLE_TYPE } from '../../property-descriptors/list-style-type';
-import { fromCodePoint } from 'css-line-break';
+import { at } from '../../../core/util';
 import { contains } from '../../../core/bitwise';
 import { CSSParsedCounterDeclaration } from '../../index';
 
@@ -10,7 +10,7 @@ export class CounterState {
         const counter = this.counters[name];
 
         if (counter && counter.length) {
-            return counter[counter.length - 1];
+            return at(counter, counter.length - 1);
         }
         return 1;
     }
@@ -21,7 +21,7 @@ export class CounterState {
     }
 
     pop(counters: string[]): void {
-        counters.forEach((counter) => this.counters[counter].pop());
+        counters.forEach((counter) => this.counters[counter]?.pop());
     }
 
     parse(style: CSSParsedCounterDeclaration): string[] {
@@ -37,7 +37,8 @@ export class CounterState {
                     if (!counter.length) {
                         counter.push(1);
                     }
-                    counter[Math.max(0, counter.length - 1)] += entry.increment;
+                    const lastIndex = Math.max(0, counter.length - 1);
+                    counter[lastIndex] = (counter[lastIndex] ?? 0) + entry.increment;
                 }
             });
         }
@@ -259,7 +260,7 @@ const createCounterStyleFromRange = (
     return (
         (value < 0 ? '-' : '') +
         (createCounterStyleWithSymbolResolver(Math.abs(value), codePointRangeLength, isNumeric, (codePoint) =>
-            fromCodePoint(Math.floor(codePoint % codePointRangeLength) + codePointRangeStart)
+            String.fromCodePoint(Math.floor(codePoint % codePointRangeLength) + codePointRangeStart)
         ) +
             suffix)
     );
@@ -272,7 +273,10 @@ const createCounterStyleFromSymbols = (value: number, symbols: string, suffix = 
             Math.abs(value),
             codePointRangeLength,
             false,
-            (codePoint) => symbols[Math.floor(codePoint % codePointRangeLength)]
+            // Upstream parity: an out-of-range index (e.g. cjk-decimal 0) joins
+            // the string as `undefined`; preserved verbatim — do not "fix"
+            // without an upstream reference (see counter.test.ts).
+            (codePoint) => String(symbols[Math.floor(codePoint % codePointRangeLength)])
         ) + suffix
     );
 };
@@ -312,9 +316,9 @@ const createCJKCounter = (
             (coefficient === 1 && digit === 1 && contains(flags, CJK_TEN_HIGH_COEFFICIENTS) && value > 100) ||
             (coefficient === 1 && digit > 1 && contains(flags, CJK_HUNDRED_COEFFICIENTS))
         ) {
-            string = numbers[coefficient] + (digit > 0 ? multipliers[digit - 1] : '') + string;
+            string = (numbers[coefficient] ?? '') + (digit > 0 ? (multipliers[digit - 1] ?? '') : '') + string;
         } else if (coefficient === 1 && digit > 0) {
-            string = multipliers[digit - 1] + string;
+            string = (multipliers[digit - 1] ?? '') + string;
         }
         tmp = Math.floor(tmp / 10);
     }

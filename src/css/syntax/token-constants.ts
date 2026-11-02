@@ -22,7 +22,7 @@ const GREATER_THAN_SIGN = 0x003e;
 const COMMERCIAL_AT = 0x0040;
 const LEFT_SQUARE_BRACKET = 0x005b;
 const RIGHT_SQUARE_BRACKET = 0x005d;
-const CIRCUMFLEX_ACCENT = 0x003d;
+const CIRCUMFLEX_ACCENT = 0x005e;
 const LEFT_CURLY_BRACKET = 0x007b;
 const QUESTION_MARK = 0x003f;
 const RIGHT_CURLY_BRACKET = 0x007d;
@@ -112,7 +112,7 @@ export {
     Z
 };
 
-import { fromCodePoint } from 'css-line-break';
+import { at } from '../../core/util';
 
 const isDigit = (codePoint: number) => codePoint >= ZERO && codePoint <= 0x0039;
 const isSurrogateCodePoint = (codePoint: number) => codePoint >= 0xd800 && codePoint <= 0xdfff;
@@ -198,25 +198,27 @@ const stringToNumber = (codePoints: number[]): number => {
         c++;
     }
 
-    const integers = [];
+    const integers: number[] = [];
 
-    while (isDigit(codePoints[c])) {
-        integers.push(codePoints[c++]);
+    while (isDigit(codePoints[c] ?? NaN)) {
+        integers.push(at(codePoints, c));
+        c++;
     }
 
-    const int = integers.length ? parseInt(fromCodePoint(...integers), 10) : 0;
+    const int = integers.length ? parseInt(String.fromCodePoint(...integers), 10) : 0;
 
     if (codePoints[c] === FULL_STOP) {
         c++;
     }
 
     const fraction = [];
-    while (isDigit(codePoints[c])) {
-        fraction.push(codePoints[c++]);
+    while (isDigit(codePoints[c] ?? NaN)) {
+        fraction.push(at(codePoints, c));
+        c++;
     }
 
     const fracd = fraction.length;
-    const frac = fracd ? parseInt(fromCodePoint(...fraction), 10) : 0;
+    const frac = fracd ? parseInt(String.fromCodePoint(...fraction), 10) : 0;
 
     if (codePoints[c] === E || codePoints[c] === e) {
         c++;
@@ -231,13 +233,14 @@ const stringToNumber = (codePoints: number[]): number => {
         c++;
     }
 
-    const exponent = [];
+    const exponent: number[] = [];
 
-    while (isDigit(codePoints[c])) {
-        exponent.push(codePoints[c++]);
+    while (isDigit(codePoints[c] ?? NaN)) {
+        exponent.push(at(codePoints, c));
+        c++;
     }
 
-    const exp = exponent.length ? parseInt(fromCodePoint(...exponent), 10) : 0;
+    const exp = exponent.length ? parseInt(String.fromCodePoint(...exponent), 10) : 0;
 
     return sign * (int + frac * Math.pow(10, -fracd)) * Math.pow(10, expsign * exp);
 };

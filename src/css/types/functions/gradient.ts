@@ -1,4 +1,5 @@
 import { CSSValue } from '../../syntax/parser';
+import { at } from '../../../core/util';
 import {
     CSSRadialExtent,
     CSSRadialGradientImage,
@@ -12,14 +13,18 @@ import { getAbsoluteValue, HUNDRED_PERCENT, isLengthPercentage, ZERO_LENGTH } fr
 import { Context } from '../../../core/context';
 
 export const parseColorStop = (context: Context, args: CSSValue[]): UnprocessedGradientColorStop => {
-    const color = colorType.parse(context, args[0]);
+    const color = colorType.parse(context, at(args, 0));
     const stop = args[1];
     return stop && isLengthPercentage(stop) ? { color, stop } : { color, stop: null };
 };
 
 export const processColorStops = (stops: UnprocessedGradientColorStop[], lineLength: number): GradientColorStop[] => {
-    const first = stops[0];
-    const last = stops[stops.length - 1];
+    // Work on a copy: callers pass shared parsed declarations, and resolving
+    // the implicit first/last stops must not mutate them (it would also make
+    // identical gradient cache keys diverge after the first render).
+    const resolvedStops: UnprocessedGradientColorStop[] = stops.map((stop) => ({ color: stop.color, stop: stop.stop }));
+    const first = at(resolvedStops, 0);
+    const last = at(resolvedStops, resolvedStops.length - 1);
     if (first.stop === null) {
         first.stop = ZERO_LENGTH;
     }
@@ -30,8 +35,8 @@ export const processColorStops = (stops: UnprocessedGradientColorStop[], lineLen
 
     const processStops: (number | null)[] = [];
     let previous = 0;
-    for (let i = 0; i < stops.length; i++) {
-        const stop = stops[i].stop;
+    for (let i = 0; i < resolvedStops.length; i++) {
+        const stop = at(resolvedStops, i).stop;
         if (stop !== null) {
             const absoluteValue = getAbsoluteValue(stop, lineLength);
             if (absoluteValue > previous) {
@@ -47,7 +52,7 @@ export const processColorStops = (stops: UnprocessedGradientColorStop[], lineLen
 
     let gapBegin = null;
     for (let i = 0; i < processStops.length; i++) {
-        const stop = processStops[i];
+        const stop = at(processStops, i);
         if (stop === null) {
             if (gapBegin === null) {
                 gapBegin = i;
@@ -63,7 +68,7 @@ export const processColorStops = (stops: UnprocessedGradientColorStop[], lineLen
         }
     }
 
-    return stops.map(({ color }, i) => {
+    return resolvedStops.map(({ color }, i) => {
         return { color, stop: Math.max(Math.min(1, (processStops[i] as number) / lineLength), 0) };
     });
 };
@@ -99,14 +104,14 @@ export const calculateGradientDirection = (
 const distance = (a: number, b: number): number => Math.sqrt(a * a + b * b);
 
 const findCorner = (width: number, height: number, x: number, y: number, closest: boolean): [number, number] => {
-    const corners = [
+    const corners: [number, number][] = [
         [0, 0],
         [0, height],
         [width, 0],
         [width, height]
     ];
 
-    return corners.reduce(
+    return corners.reduce<{ optimumCorner: [number, number] | null; optimumDistance: number }>(
         (stat, corner) => {
             const [cx, cy] = corner;
             const d = distance(x - cx, y - cy);
@@ -198,8 +203,9 @@ export const calculateRadius = (
     }
 
     if (Array.isArray(gradient.size)) {
-        rx = getAbsoluteValue(gradient.size[0], width);
-        ry = gradient.size.length === 2 ? getAbsoluteValue(gradient.size[1], height) : rx;
+        const size = gradient.size;
+        rx = getAbsoluteValue(at(size, 0), width);
+        ry = size.length === 2 ? getAbsoluteValue(at(size, 1), height) : rx;
     }
 
     return [rx, ry];

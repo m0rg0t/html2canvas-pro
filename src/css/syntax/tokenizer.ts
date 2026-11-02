@@ -1,6 +1,5 @@
 // https://www.w3.org/TR/css-syntax-3
 
-import { toCodePoints, fromCodePoint } from 'css-line-break';
 import { TokenType, FLAG_UNRESTRICTED, FLAG_ID, FLAG_INTEGER, FLAG_NUMBER } from './token-types';
 import type {
     CSSToken,
@@ -152,17 +151,31 @@ export class Tokenizer {
     }
 
     private _value: number[];
+    /**
+     * Read cursor into `_value`. Consumption advances the cursor instead of
+     * shifting the array — `Array.shift()` per code point makes tokenising a
+     * long value O(n²) (a 200 KB inline data-URI background alone would cost
+     * billions of operations, and background-image values are never parse-
+     * cached). `write()` compacts already-consumed prefix bytes.
+     */
+    private _cursor: number;
 
     constructor() {
         this._value = [];
+        this._cursor = 0;
     }
 
     private _reset(): void {
         this._value = [];
+        this._cursor = 0;
     }
 
     write(chunk: string): void {
-        this._value = this._value.concat(toCodePoints(chunk));
+        if (this._cursor > 0) {
+            this._value = this._value.slice(this._cursor);
+            this._cursor = 0;
+        }
+        this._value = this._value.concat([...chunk].map((char) => char.codePointAt(0) as number));
     }
 
     read(): CSSToken[] {
@@ -276,6 +289,7 @@ export class Tokenizer {
                 ) {
                     this.consumeCodePoint();
                     this.consumeCodePoint();
+                    this.consumeCodePoint();
                     return CDO_TOKEN;
                 }
                 break;
@@ -315,7 +329,7 @@ export class Tokenizer {
                 const u2 = this.peekCodePoint(1);
                 if (u1 === PLUS_SIGN && (isHex(u2) || u2 === QUESTION_MARK)) {
                     this.consumeCodePoint();
-                    this.consumeUnicodeRangeToken();
+                    return this.consumeUnicodeRangeToken();
                 }
                 this.reconsumeCodePoint(codePoint);
                 return this.consumeIdentLikeToken();
@@ -355,25 +369,32 @@ export class Tokenizer {
             return this.consumeIdentLikeToken();
         }
 
-        return { type: TokenType.DELIM_TOKEN, value: fromCodePoint(codePoint) };
+        return { type: TokenType.DELIM_TOKEN, value: String.fromCodePoint(codePoint) };
     }
 
     private consumeCodePoint(): number {
-        const value = this._value.shift();
+        const value = this._value[this._cursor];
 
-        return typeof value === 'undefined' ? -1 : value;
+        if (value === undefined) {
+            return -1;
+        }
+        this._cursor++;
+        return value;
     }
 
     private reconsumeCodePoint(codePoint: number) {
-        this._value.unshift(codePoint);
+        // Reconsuming always rewinds the code point that was just consumed;
+        // the defensive splice covers hypothetical out-of-order callers.
+        if (this._cursor > 0 && this._value[this._cursor - 1] === codePoint) {
+            this._cursor--;
+        } else {
+            this._value.splice(this._cursor, 0, codePoint);
+        }
     }
 
     private peekCodePoint(delta: number): number {
-        if (delta >= this._value.length) {
-            return -1;
-        }
-
-        return this._value[delta];
+        const codePoint = this._value[this._cursor + delta];
+        return codePoint !== undefined ? codePoint : -1;
     }
 
     private consumeUnicodeRangeToken(): UnicodeRangeToken {
@@ -392,23 +413,25 @@ export class Tokenizer {
 
         if (questionMarks) {
             const start = parseInt(
-                fromCodePoint(...digits.map((digit) => (digit === QUESTION_MARK ? ZERO : digit))),
+                String.fromCodePoint(...digits.map((digit) => (digit === QUESTION_MARK ? ZERO : digit))),
                 16
             );
-            const end = parseInt(fromCodePoint(...digits.map((digit) => (digit === QUESTION_MARK ? F : digit))), 16);
+            const end = parseInt(
+                String.fromCodePoint(...digits.map((digit) => (digit === QUESTION_MARK ? F : digit))),
+                16
+            );
             return { type: TokenType.UNICODE_RANGE_TOKEN, start, end };
         }
 
-        const start = parseInt(fromCodePoint(...digits), 16);
-        if (this.peekCodePoint(0) === HYPHEN_MINUS && isHex(this.peekCodePoint(1))) {
-            this.consumeCodePoint();
+        const start = parseInt(String.fromCodePoint(...digits), 16);
+        if (codePoint === HYPHEN_MINUS && isHex(this.peekCodePoint(0))) {
             codePoint = this.consumeCodePoint();
             const endDigits = [];
             while (isHex(codePoint) && endDigits.length < 6) {
                 endDigits.push(codePoint);
                 codePoint = this.consumeCodePoint();
             }
-            const end = parseInt(fromCodePoint(...endDigits), 16);
+            const end = parseInt(String.fromCodePoint(...endDigits), 16);
 
             return { type: TokenType.UNICODE_RANGE_TOKEN, start, end };
         } else {
@@ -456,12 +479,12 @@ export class Tokenizer {
         while (true) {
             const codePoint = this.consumeCodePoint();
             if (codePoint === EOF || codePoint === RIGHT_PARENTHESIS) {
-                return { type: TokenType.URL_TOKEN, value: fromCodePoint(...value) };
+                return { type: TokenType.URL_TOKEN, value: String.fromCodePoint(...value) };
             } else if (isWhiteSpace(codePoint)) {
                 this.consumeWhiteSpace();
                 if (this.peekCodePoint(0) === EOF || this.peekCodePoint(0) === RIGHT_PARENTHESIS) {
                     this.consumeCodePoint();
-                    return { type: TokenType.URL_TOKEN, value: fromCodePoint(...value) };
+                    return { type: TokenType.URL_TOKEN, value: String.fromCodePoint(...value) };
                 }
                 this.consumeBadUrlRemnants();
                 return BAD_URL_TOKEN;
@@ -508,12 +531,16 @@ export class Tokenizer {
     private consumeStringSlice(count: number): string {
         const SLICE_STACK_SIZE = 50000;
         let value = '';
-        while (count > 0) {
-            const amount = Math.min(SLICE_STACK_SIZE, count);
-            value += fromCodePoint(...this._value.splice(0, amount));
-            count -= amount;
+        const end = this._cursor + count;
+        let from = this._cursor;
+        while (from < end) {
+            const to = Math.min(end, from + SLICE_STACK_SIZE);
+            value += String.fromCodePoint(...this._value.slice(from, to));
+            from = to;
         }
-        this._value.shift();
+        // Drop the terminator (the closing quote, or the backslash when the
+        // caller continues with consumeEscapedCodePoint).
+        this._cursor = end + 1;
 
         return value;
     }
@@ -523,27 +550,27 @@ export class Tokenizer {
         let i = 0;
 
         do {
-            const codePoint = this._value[i];
+            const codePoint = this._value[this._cursor + i];
             if (codePoint === EOF || codePoint === undefined || codePoint === endingCodePoint) {
                 value += this.consumeStringSlice(i);
                 return { type: TokenType.STRING_TOKEN, value };
             }
 
             if (codePoint === LINE_FEED) {
-                this._value.splice(0, i);
+                this._cursor += i;
                 return BAD_STRING_TOKEN;
             }
 
             if (codePoint === REVERSE_SOLIDUS) {
-                const next = this._value[i + 1];
+                const next = this._value[this._cursor + i + 1];
                 if (next !== EOF && next !== undefined) {
                     if (next === LINE_FEED) {
                         value += this.consumeStringSlice(i);
                         i = -1;
-                        this._value.shift();
+                        this._cursor++;
                     } else if (isValidEscape(codePoint, next)) {
                         value += this.consumeStringSlice(i);
-                        value += fromCodePoint(this.consumeEscapedCodePoint());
+                        value += String.fromCodePoint(this.consumeEscapedCodePoint());
                         i = -1;
                     }
                 }
@@ -553,7 +580,7 @@ export class Tokenizer {
         } while (true);
     }
 
-    private consumeNumber() {
+    private consumeNumber(): [number, number] {
         const repr = [];
         let type = FLAG_INTEGER;
         let c1 = this.peekCodePoint(0);
@@ -611,9 +638,9 @@ export class Tokenizer {
         const codePoint = this.consumeCodePoint();
 
         if (isHex(codePoint)) {
-            let hex = fromCodePoint(codePoint);
+            let hex = String.fromCodePoint(codePoint);
             while (isHex(this.peekCodePoint(0)) && hex.length < 6) {
-                hex += fromCodePoint(this.consumeCodePoint());
+                hex += String.fromCodePoint(this.consumeCodePoint());
             }
 
             if (isWhiteSpace(this.peekCodePoint(0))) {
@@ -641,9 +668,9 @@ export class Tokenizer {
         while (true) {
             const codePoint = this.consumeCodePoint();
             if (isNameCodePoint(codePoint)) {
-                result += fromCodePoint(codePoint);
+                result += String.fromCodePoint(codePoint);
             } else if (isValidEscape(codePoint, this.peekCodePoint(0))) {
-                result += fromCodePoint(this.consumeEscapedCodePoint());
+                result += String.fromCodePoint(this.consumeEscapedCodePoint());
             } else {
                 this.reconsumeCodePoint(codePoint);
                 return result;

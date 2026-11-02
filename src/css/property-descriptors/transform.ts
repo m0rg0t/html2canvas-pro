@@ -1,4 +1,5 @@
 import { IPropertyValueDescriptor, PropertyDescriptorParsingType } from '../property-descriptor';
+import { at } from '../../core/util';
 import { CSSValue } from '../syntax/parser';
 import { NumberValueToken, TokenType } from '../syntax/tokenizer';
 import { Context } from '../../core/context';
@@ -29,18 +30,25 @@ export const transform: IPropertyValueDescriptor<Transform> = {
 };
 
 const matrix = (_context: Context, args: CSSValue[]): Transform => {
-    const values = args.filter((arg) => arg.type === TokenType.NUMBER_TOKEN).map((arg: NumberValueToken) => arg.number);
+    const values = args
+        .filter((arg): arg is NumberValueToken => arg.type === TokenType.NUMBER_TOKEN)
+        .map((arg) => arg.number);
 
     return values.length === 6 ? (values as Matrix) : null;
 };
 
 // doesn't support 3D transforms at the moment
 const matrix3d = (_context: Context, args: CSSValue[]): Transform => {
-    const values = args.filter((arg) => arg.type === TokenType.NUMBER_TOKEN).map((arg: NumberValueToken) => arg.number);
+    const values = args
+        .filter((arg): arg is NumberValueToken => arg.type === TokenType.NUMBER_TOKEN)
+        .map((arg) => arg.number);
 
-    const [a1, b1, {}, {}, a2, b2, {}, {}, {}, {}, {}, {}, a4, b4, {}, {}] = values;
+    if (values.length !== 16) {
+        return null;
+    }
 
-    return values.length === 16 ? [a1, b1, a2, b2, a4, b4] : null;
+    // Row-major 3D matrix; only the 2D-relevant components are retained.
+    return [at(values, 0), at(values, 1), at(values, 4), at(values, 5), at(values, 12), at(values, 13)];
 };
 
 const rotate = (context: Context, args: CSSValue[]): Transform => {
@@ -48,7 +56,7 @@ const rotate = (context: Context, args: CSSValue[]): Transform => {
         return null;
     }
 
-    const arg = args[0];
+    const arg = at(args, 0);
     let radians = 0;
 
     if (arg.type === TokenType.NUMBER_TOKEN && arg.number === 0) {

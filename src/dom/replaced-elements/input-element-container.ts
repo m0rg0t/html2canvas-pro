@@ -1,4 +1,4 @@
-import { ElementContainer } from '../element-container';
+import { ElementContainer, ElementContainerOptions } from '../element-container';
 import { BORDER_STYLE } from '../../css/property-descriptors/border-style';
 import { BACKGROUND_CLIP } from '../../css/property-descriptors/background-clip';
 import { BACKGROUND_ORIGIN } from '../../css/property-descriptors/background-origin';
@@ -46,7 +46,9 @@ const isPlaceholder = (node: HTMLInputElement): boolean => {
 export const CHECKBOX = 'checkbox';
 export const RADIO = 'radio';
 export const PASSWORD = 'password';
-export const INPUT_COLOR = 0x2a2a2aff;
+// Fallback for `accent-color: auto`: the default accent colour browsers use
+// for checked controls (Chrome/Safari/Firefox all ship the same blue).
+export const INPUT_COLOR = 0x0075ffff;
 // Default placeholder color (similar to browsers: rgba(117, 117, 117, 1) or #757575)
 export const PLACEHOLDER_COLOR = 0x757575ff;
 
@@ -56,8 +58,8 @@ export class InputElementContainer extends ElementContainer {
     readonly value: string;
     readonly isPlaceholder: boolean;
 
-    constructor(context: Context, input: HTMLInputElement) {
-        super(context, input);
+    constructor(context: Context, input: HTMLInputElement, options: ElementContainerOptions = {}) {
+        super(context, input, options);
         this.type = input.type.toLowerCase();
         this.checked = input.checked;
         this.value = getInputValue(input);

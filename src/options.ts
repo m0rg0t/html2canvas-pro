@@ -8,6 +8,19 @@ import { Validator } from './core/validator';
  *
  * Combines clone, window, render, and context configuration into a single
  * options object. All properties are optional.
+ *
+ * The full surface is composed from these interfaces (each documented where
+ * it is declared):
+ * - {@link CloneOptions} — `ignoreElements`, `onclone`, `allowTaint`,
+ *   `iframeContainer` (src/dom/document-cloner.ts)
+ * - {@link WindowOptions} — `scrollX`, `scrollY`, `windowWidth`,
+ *   `windowHeight` (src/dom/document-cloner.ts)
+ * - {@link RenderOptions} — `scale`, `canvas`, `x`, `y`, `width`, `height`
+ *   (src/render/canvas/canvas-renderer.ts)
+ * - {@link ContextOptions} — `logging`, `cache`, `onError`, plus the
+ *   `ResourceOptions` it extends: `imageTimeout`, `useCORS`, `proxy`,
+ *   `customIsSameOrigin`, `maxCacheSize` (src/core/context.ts and
+ *   src/core/cache-storage.ts)
  */
 export type Options = CloneOptions &
     WindowOptions &
@@ -19,6 +32,14 @@ export type Options = CloneOptions &
         foreignObjectRendering: boolean;
         /** Whether to remove the cloned iframe after rendering. @default true */
         removeContainer?: boolean;
+        /**
+         * Normalize the cloned DOM before parsing: disable CSS animations and
+         * replace active transforms with identity values so element bounds are
+         * measured in layout space. Set to `false` to keep animation/transform
+         * state intact during capture.
+         * @default true
+         */
+        normalizeDom?: boolean;
         /** CSP nonce for inline style elements. */
         cspNonce?: string;
         /** Custom input validator. */
@@ -55,12 +76,21 @@ export type Options = CloneOptions &
         /**
          * Called when a resource fails to load (image, font, iframe, etc.).
          * The render continues — this is a notification hook, not an abort.
+         * Image/proxy load failures are reported exactly once, by the
+         * resource cache at load time; iframe content failures are reported
+         * by the iframe container.
          */
         onError?: (error: Error) => void;
         /**
          * Called at key milestones during the render pipeline.
-         * `phase` is one of: 'clone', 'parse', 'layout', 'render'.
-         * `progress` is 0..100 percentage estimate.
+         * `phase` is one of: 'clone' | 'parse' | 'preload' | 'layout' | 'render'.
+         * `progress` is a coarse 0–100 estimate. Milestones:
+         *   clone 10 (cloning starts), clone 30 (cloned document ready),
+         *   parse 50 (style/DOM parse done),
+         *   preload 50–60 (image fetching; one event per settled batch),
+         *   layout 60 (bounds + images ready),
+         *   render 90 (canvas painted), render 100 (cleanup done).
+         * Callback exceptions are caught and logged, never fatal.
          */
         onProgress?: (phase: string, progress: number) => void;
     };

@@ -105,12 +105,12 @@ describe('renderTextWithLetterSpacing', () => {
         // Verify letter spacing is added between characters
         // A: x=100, B: x=100+10+5=115, C: x=115+12+5=132
         strictEqual(fillCalls.length, 3);
-        strictEqual(fillCalls[0].text, 'A');
-        strictEqual(fillCalls[0].x, 100);
-        strictEqual(fillCalls[1].text, 'B');
-        strictEqual(fillCalls[1].x, 115); // 100 + measureText('A').width(10) + letterSpacing(5)
-        strictEqual(fillCalls[2].text, 'C');
-        strictEqual(fillCalls[2].x, 132); // 115 + measureText('B').width(12) + letterSpacing(5)
+        strictEqual(fillCalls[0]?.text, 'A');
+        strictEqual(fillCalls[0]?.x, 100);
+        strictEqual(fillCalls[1]?.text, 'B');
+        strictEqual(fillCalls[1]?.x, 115); // 100 + measureText('A').width(10) + letterSpacing(5)
+        strictEqual(fillCalls[2]?.text, 'C');
+        strictEqual(fillCalls[2]?.x, 132); // 115 + measureText('B').width(12) + letterSpacing(5)
 
         // Verify y position uses baseline
         fillCalls.forEach((call) => {
@@ -118,7 +118,7 @@ describe('renderTextWithLetterSpacing', () => {
         });
     });
 
-    it('should use ideographic baseline for CJK characters (Issue #73 Bug2)', () => {
+    it('should keep CJK characters on the alphabetic baseline in horizontal text', () => {
         const baselineChanges: string[] = [];
         let currentBaseline: CanvasTextBaseline = 'alphabetic';
 
@@ -149,12 +149,7 @@ describe('renderTextWithLetterSpacing', () => {
 
         renderer.renderTextWithLetterSpacing(text, 10, 20);
 
-        // Should have switched to ideographic for each CJK char and restored
-        // Pattern: [ideographic, alphabetic, ideographic, alphabetic]
-        ok(baselineChanges.includes('ideographic'), 'should switch to ideographic baseline for CJK');
-        // Should restore alphabetic after each CJK char
-        const ideographicIdx = baselineChanges.indexOf('ideographic');
-        strictEqual(baselineChanges[ideographicIdx + 1], 'alphabetic');
+        deepStrictEqual(baselineChanges, [], 'should not switch baseline for CJK in horizontal text');
     });
 
     it('should not change textBaseline for non-CJK characters', () => {
@@ -248,12 +243,12 @@ describe('renderTextWithLetterSpacing', () => {
         renderer.renderTextWithLetterSpacing(text, -3, 15);
 
         // A: x=100, B: x=100 + 10 + (-3) = 107
-        strictEqual(fillCalls[0].x, 100);
-        strictEqual(fillCalls[1].x, 107);
+        strictEqual(fillCalls[0]?.x, 100);
+        strictEqual(fillCalls[1]?.x, 107);
     });
 
-    it('should handle mixed CJK and Latin text with correct baseline per character', () => {
-        const baselineAtRender: Record<string, string> = {};
+    it('should draw mixed CJK and Latin text on the same baseline as the whole-string path', () => {
+        const calls: Array<{ text: string; y: number; baseline: CanvasTextBaseline }> = [];
         let currentBaseline: CanvasTextBaseline = 'alphabetic';
 
         const ctx = {
@@ -265,8 +260,8 @@ describe('renderTextWithLetterSpacing', () => {
             set textBaseline(value: CanvasTextBaseline) {
                 currentBaseline = value;
             },
-            fillText(text: string, _x: number, _y: number) {
-                baselineAtRender[text] = currentBaseline;
+            fillText(text: string, _x: number, y: number) {
+                calls.push({ text, y, baseline: currentBaseline });
             },
             measureText(_text: string) {
                 return { width: 12 };
@@ -283,11 +278,15 @@ describe('renderTextWithLetterSpacing', () => {
         // Mixed: Latin 'A', CJK '快', Latin 'B'
         const text = new TextBounds('A快B', bounds);
 
+        renderer.renderTextWithLetterSpacing(text, 0, 20);
+        const [wholeString] = calls.splice(0);
+
         renderer.renderTextWithLetterSpacing(text, 5, 20);
 
-        strictEqual(baselineAtRender['A'], 'alphabetic', 'Latin char should use alphabetic baseline');
-        strictEqual(baselineAtRender['快'], 'ideographic', 'CJK char should use ideographic baseline');
-        strictEqual(baselineAtRender['B'], 'alphabetic', 'Latin char after CJK should restore alphabetic baseline');
+        deepStrictEqual(
+            calls,
+            ['A', '快', 'B'].map((letter) => ({ text: letter, y: wholeString!.y, baseline: wholeString!.baseline }))
+        );
     });
 
     it('should handle empty string without errors', () => {
@@ -490,7 +489,7 @@ describe('renderTextNode', () => {
         strictEqual(fillCalls.length, 1);
         // Y should be: bounds.top(50) + actualBoundingBoxAscent(14) = 64
         // NOT: bounds.top(50) + fontSize.number(16) = 66
-        strictEqual(fillCalls[0].y, 64, 'should use actualBoundingBoxAscent (64), not fontSize.number (66)');
+        strictEqual(fillCalls[0]?.y, 64, 'should use actualBoundingBoxAscent (64), not fontSize.number (66)');
     });
 
     it('should fallback to fontSize.number when actualBoundingBoxAscent is not available', async () => {
@@ -561,6 +560,120 @@ describe('renderTextNode', () => {
         // Verify fallback to fontSize.number (16)
         strictEqual(fillCalls.length, 1);
         // Y should be: bounds.top(50) + fontSize.number(16) = 66
-        strictEqual(fillCalls[0].y, 66, 'should fallback to fontSize.number (66)');
+        strictEqual(fillCalls[0]?.y, 66, 'should fallback to fontSize.number (66)');
+    });
+});
+
+describe('TextRenderer text-shadow scaling', () => {
+    type ShadowProp = 'blur' | 'offsetX' | 'offsetY';
+    interface ShadowSet {
+        prop: ShadowProp;
+        value: number;
+    }
+
+    const buildBaseCtx = () =>
+        ({
+            fillStyle: '',
+            font: '',
+            textBaseline: 'alphabetic' as CanvasTextBaseline,
+            direction: 'ltr' as CanvasDirection,
+            textAlign: 'left' as CanvasTextAlign,
+            fillText() {},
+            measureText() {
+                return { width: 30, actualBoundingBoxAscent: 14 };
+            },
+            strokeStyle: '',
+            lineWidth: 0,
+            lineJoin: 'miter' as CanvasLineJoin,
+            strokeText() {},
+            shadowColor: '',
+            shadowOffsetX: 0,
+            shadowOffsetY: 0,
+            shadowBlur: 0,
+            save() {},
+            restore() {}
+        }) as unknown as CanvasRenderingContext2D;
+
+    const buildShadowStyles = () =>
+        ({
+            fontFamily: ['Arial'],
+            fontSize: { number: 16, unit: 'px' },
+            fontStyle: 'normal',
+            fontVariant: [],
+            fontWeight: 'normal',
+            color: { r: 0, g: 0, b: 0, a: 1 },
+            letterSpacing: 0,
+            webkitTextStrokeWidth: 0,
+            textShadow: [
+                {
+                    color: { r: 0, g: 0, b: 0, a: 1 },
+                    offsetX: { number: 2 },
+                    offsetY: { number: 3 },
+                    blur: { number: 4 }
+                }
+            ],
+            textDecorationLine: [],
+            paintOrder: [0],
+            direction: 0,
+            writingMode: WRITING_MODE.HORIZONTAL_TB,
+            display: 0,
+            webkitLineClamp: 0,
+            textOverflow: 0,
+            overflowX: 0,
+            overflowY: 0
+        }) as unknown as Parameters<TextRenderer['renderTextNode']>[1];
+
+    const buildTextContainer = () =>
+        ({
+            textBounds: [new TextBounds('gj', new Bounds(10, 50, 100, 25))],
+            parse: () => {}
+        }) as unknown as Parameters<TextRenderer['renderTextNode']>[0];
+
+    /** renderTextFillWithShadows resets the metrics after drawing, so the
+     *  assertions inspect the recorded assignment sequence. */
+    const recordShadowSets = (ctx: CanvasRenderingContext2D): ShadowSet[] => {
+        const sets: ShadowSet[] = [];
+        const record = (prop: ShadowProp) => ({
+            set: (v: number) => {
+                sets.push({ prop, value: v });
+            },
+            get: () => 0
+        });
+        Object.defineProperty(ctx, 'shadowBlur', record('blur'));
+        Object.defineProperty(ctx, 'shadowOffsetX', record('offsetX'));
+        Object.defineProperty(ctx, 'shadowOffsetY', record('offsetY'));
+        return sets;
+    };
+
+    // The trailing reset writes 0; keep only real shadow assignments.
+    const valuesOf = (sets: ShadowSet[], prop: ShadowProp): number[] =>
+        sets.filter((s) => s.prop === prop && s.value !== 0).map((s) => s.value);
+
+    it('scales text-shadow blur and offsets by the device scale', async () => {
+        const ctx = buildBaseCtx();
+        const sets = recordShadowSets(ctx);
+        const renderer = new TextRenderer({ ctx, options: { scale: 2 } });
+        renderer.createFontStyle = () => ['16px Arial', 'Arial', '16px'];
+
+        await renderer.renderTextNode(buildTextContainer(), buildShadowStyles());
+
+        // Canvas shadow metrics live in device space, so both the offsets
+        // and the blur must be multiplied by the context scale.
+        deepStrictEqual(valuesOf(sets, 'offsetX'), [4]);
+        deepStrictEqual(valuesOf(sets, 'offsetY'), [6]);
+        deepStrictEqual(valuesOf(sets, 'blur'), [8]);
+    });
+
+    it('keeps shadow metrics unscaled at scale 1', async () => {
+        const ctx = buildBaseCtx();
+        const sets = recordShadowSets(ctx);
+        const renderer = new TextRenderer({ ctx, options: { scale: 1 } });
+        renderer.createFontStyle = () => ['16px Arial', 'Arial', '16px'];
+
+        await renderer.renderTextNode(buildTextContainer(), buildShadowStyles());
+
+        deepStrictEqual(valuesOf(sets, 'offsetX'), [2]);
+        deepStrictEqual(valuesOf(sets, 'offsetY'), [3]);
+        deepStrictEqual(valuesOf(sets, 'blur'), [4]);
     });
 });

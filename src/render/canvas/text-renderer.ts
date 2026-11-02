@@ -12,6 +12,7 @@
  */
 
 import { TextContainer } from '../../dom/text-container';
+import { at } from '../../core/util';
 import { CSSParsedDeclaration } from '../../css';
 import { Bounds } from '../../css/layout/bounds';
 import { TextBounds, segmentGraphemes } from '../../css/layout/text';
@@ -30,6 +31,7 @@ import {
 } from '../../css/property-descriptors/writing-mode';
 import { TextDecorationRenderer } from './text/text-decoration-renderer';
 import { measureBaseline } from './font-utils';
+import { computeLineHeight } from '../../css/property-descriptors/line-height';
 
 /**
  * Dependencies required for TextRenderer
@@ -41,9 +43,6 @@ export interface TextRendererDependencies {
     };
 }
 
-// iOS font fix - see https://github.com/niklasvh/html2canvas/pull/2645
-const iOSBrokenFonts = ['-apple-system', 'system-ui'];
-
 // Tolerance (px) for text-overflow: ellipsis detection. Canvas measureText can
 // report a width a fraction of a pixel wider than the browser's layout box, so
 // text that fits exactly must not be truncated (issue #226).
@@ -51,8 +50,8 @@ const TEXT_OVERFLOW_EPSILON = 1;
 
 /**
  * Detect CJK (Chinese, Japanese, Korean) characters in a string.
- * CJK characters use the ideographic baseline in browsers, which differs
- * from the alphabetic baseline used for Latin script.
+ * Vertical writing modes use it to keep CJK glyphs upright and on the
+ * ideographic baseline while other scripts are rotated.
  *
  * Covers:
  *   U+2E80–U+2FFF  CJK Radicals Supplement, Kangxi Radicals
@@ -68,65 +67,26 @@ const CJK_CHAR_REGEX = /[\u2E80-\u2FFF\u3000-\u30FF\u3400-\u4DBF\u4E00-\u9FFF\uA
 export const hasCJKCharacters = (text: string): boolean => CJK_CHAR_REGEX.test(text);
 
 /**
- * Detect iOS version from user agent
- * Returns null if not iOS or version cannot be determined
+ * Chromium-based engines render stroked text with visibly sharper joins when
+ * `miter` is requested, closely matching their own -webkit-text-stroke
+ * output; other engines need `round` joins to avoid glyph spikes. No CSS or
+ * platform API expresses this behavioural difference, so engine detection is
+ * the only reliable signal: `navigator.userAgentData` is Chromium-only, with
+ * the legacy `window.chrome` marker as a fallback for older webviews.
  */
-const getIOSVersion = (): number | null => {
+const isChromiumEngine = (): boolean => {
     if (typeof navigator === 'undefined') {
-        return null;
+        return false;
     }
-
-    const userAgent = navigator.userAgent;
-
-    // Check if it's iOS or iPadOS
-    // iPadOS 13+ may identify as Macintosh, check for touch support
-    const isIOS = /iPhone|iPad|iPod/.test(userAgent);
-    const isIPadOS = /Macintosh/.test(userAgent) && navigator.maxTouchPoints && navigator.maxTouchPoints > 1;
-
-    if (!isIOS && !isIPadOS) {
-        return null;
+    const nav = navigator as Navigator & { userAgentData?: unknown };
+    if (nav.userAgentData !== undefined) {
+        return true;
     }
-
-    // Extract version number from various iOS user agent formats:
-    // - "iPhone OS 15_0" or "iPhone OS 15_0_1"
-    // - "CPU OS 15_0 like Mac OS X"
-    // - "CPU iPhone OS 15_0 like Mac OS X"
-    // - "Version/15.0" (for iPadOS)
-    const patterns = [
-        /(?:iPhone|CPU(?:\siPhone)?)\sOS\s(\d+)[\._](\d+)/, // iPhone OS, CPU OS, CPU iPhone OS
-        /Version\/(\d+)\.(\d+)/ // Version/15.0 (iPadOS)
-    ];
-
-    for (const pattern of patterns) {
-        const match = userAgent.match(pattern);
-        if (match && match[1]) {
-            return parseInt(match[1], 10);
-        }
-    }
-
-    return null;
-};
-
-const fixIOSSystemFonts = (fontFamilies: string[]): string[] => {
-    const iosVersion = getIOSVersion();
-
-    // On iOS 15.0 and 15.1, system fonts have rendering issues
-    // Fixed in iOS 17+
-    if (iosVersion !== null && iosVersion >= 15 && iosVersion < 17) {
-        return fontFamilies.map((fontFamily) =>
-            iOSBrokenFonts.indexOf(fontFamily) !== -1
-                ? `-apple-system, "Helvetica Neue", Arial, sans-serif`
-                : fontFamily
-        );
-    }
-
-    return fontFamilies;
-};
-
-const getTextStrokeLineJoin = (): CanvasLineJoin => {
     const currentWindow = typeof window !== 'undefined' ? (window as Window & { chrome?: unknown }) : undefined;
-    return currentWindow?.chrome ? 'miter' : 'round';
+    return currentWindow?.chrome !== undefined;
 };
+
+export const getTextStrokeLineJoin = (): CanvasLineJoin => (isChromiumEngine() ? 'miter' : 'round');
 
 /**
  * Text Renderer
@@ -138,6 +98,13 @@ export class TextRenderer {
     private readonly ctx: CanvasRenderingContext2D;
     private readonly options: { scale: number };
     private readonly decorationRenderer: TextDecorationRenderer;
+    /**
+     * Baseline ascent per font string. Consecutive text nodes overwhelmingly
+     * share a font, and each measureBaseline call issues a canvas measureText,
+     * so repeated fonts are memoised (bounded; cleared if the working set
+     * exceeds the cap).
+     */
+    private readonly baselineCache: Map<string, number> = new Map();
     /**
      * Per-render glyph width cache. Keyed by glyph + font string,
      * avoids redundant `measureText` calls when letter-spacing is non-zero.
@@ -172,15 +139,17 @@ export class TextRenderer {
     }
 
     /**
-     * Iterate grapheme clusters one-by-one, applying correct letter-spacing and
-     * per-script baseline for each character.
+     * Iterate grapheme clusters one-by-one, applying correct letter-spacing.
      *
      * Issue #73: When letter-spacing is non-zero, text must be rendered character by
-     * character. This helper centralises two fixes applied during that iteration:
-     *   1. Add `letterSpacing` to each character's advance width (was previously
-     *      omitted, causing characters to render without any spacing).
-     *   2. Switch to the ideographic baseline for CJK glyphs so their vertical
-     *      position matches how browsers lay them out in the DOM.
+     * character, adding `letterSpacing` to each character's advance width.
+     *
+     * In horizontal text every glyph keeps the alphabetic baseline, CJK included:
+     * inline layout aligns a whole line on its alphabetic baseline regardless of
+     * script, and `baseline` was measured for that. Drawing CJK graphemes at the
+     * same y with `textBaseline = 'ideographic'` lifts them above the Latin text
+     * next to them, and away from where the `letterSpacing === 0` whole-string
+     * path draws them.
      *
      * The `renderFn` callback receives (letter, x, y) and performs the actual draw
      * call (fillText or strokeText), allowing fill and stroke paths to share one
@@ -203,14 +172,7 @@ export class TextRenderer {
         const fontString = this.ctx.font;
         let left = text.bounds.left;
         for (const letter of letters) {
-            if (hasCJKCharacters(letter)) {
-                const savedBaseline = this.ctx.textBaseline;
-                this.ctx.textBaseline = 'ideographic';
-                renderFn(letter, left, y);
-                this.ctx.textBaseline = savedBaseline;
-            } else {
-                renderFn(letter, left, y);
-            }
+            renderFn(letter, left, y);
             left += this.cachedMeasureText(letter, fontString) + letterSpacing;
         }
     }
@@ -227,8 +189,8 @@ export class TextRenderer {
         const rotationAngle = writingMode === WRITING_MODE.SIDEWAYS_LR ? -Math.PI / 2 : Math.PI / 2;
         let top = text.bounds.top;
 
-        for (let i = 0; i < letters.length; ) {
-            const letter = letters[i];
+        for (let i = 0; i < letters.length;) {
+            const letter = letters[i] as string;
             const isSideways =
                 isSidewaysWritingMode(writingMode) || (!hasCJKCharacters(letter) && letter.trim().length > 0);
 
@@ -248,7 +210,7 @@ export class TextRenderer {
             // ── Batch consecutive sideways glyphs into one save/restore ──
             const runStart = i;
             while (i < letters.length) {
-                const ch = letters[i];
+                const ch = letters[i] as string;
                 if (!isSidewaysWritingMode(writingMode) && !hasCJKCharacters(ch) && ch.trim().length === 0) break;
                 if (isSidewaysWritingMode(writingMode) || (!hasCJKCharacters(ch) && ch.trim().length > 0)) {
                     i++;
@@ -263,8 +225,9 @@ export class TextRenderer {
             this.ctx.rotate(rotationAngle);
             let runOffset = 0;
             for (let j = runStart; j < i; j++) {
-                renderFn(letters[j], 0, runOffset);
-                runOffset += this.cachedMeasureText(letters[j], fontString) + letterSpacing;
+                const glyph = letters[j] as string;
+                renderFn(glyph, 0, runOffset);
+                runOffset += this.cachedMeasureText(glyph, fontString) + letterSpacing;
             }
             this.ctx.restore();
             top += runOffset;
@@ -274,7 +237,7 @@ export class TextRenderer {
     /**
      * Render text with letter-spacing applied (fill pass).
      * When letterSpacing is 0 the whole string is drawn in one call; otherwise each
-     * grapheme is drawn individually so spacing and CJK baseline are applied correctly.
+     * grapheme is drawn individually so spacing is applied correctly.
      */
     renderTextWithLetterSpacing(
         text: TextBounds,
@@ -329,7 +292,7 @@ export class TextRenderer {
     }
 
     private renderTextFillWithShadows(text: TextBounds, styles: CSSParsedDeclaration, baseline: number): void {
-        this.ctx.fillStyle = asString(styles.color);
+        this.ctx.fillStyle = this.resolveFillColor(styles);
         this.renderTextWithLetterSpacing(text, styles.letterSpacing, baseline, styles.writingMode);
 
         const textShadows: TextShadow = styles.textShadow;
@@ -341,7 +304,10 @@ export class TextRenderer {
                     this.ctx.shadowColor = asString(textShadow.color);
                     this.ctx.shadowOffsetX = textShadow.offsetX.number * this.options.scale;
                     this.ctx.shadowOffsetY = textShadow.offsetY.number * this.options.scale;
-                    this.ctx.shadowBlur = textShadow.blur.number;
+                    // Canvas shadow metrics live in device space (unaffected
+                    // by the context transform), so blur scales like the
+                    // offsets above.
+                    this.ctx.shadowBlur = textShadow.blur.number * this.options.scale;
 
                     this.renderTextWithLetterSpacing(text, styles.letterSpacing, baseline, styles.writingMode);
                 });
@@ -366,7 +332,7 @@ export class TextRenderer {
         paintOrderLayers.forEach((paintOrderLayer: number) => {
             switch (paintOrderLayer) {
                 case PAINT_ORDER_LAYER.FILL:
-                    this.ctx.fillStyle = asString(styles.color);
+                    this.ctx.fillStyle = this.resolveFillColor(styles);
                     this.renderTextWithLetterSpacing(textBound, styles.letterSpacing, baseline, styles.writingMode);
                     break;
                 case PAINT_ORDER_LAYER.STROKE:
@@ -441,7 +407,7 @@ export class TextRenderer {
         const fontVariant = styles.fontVariant
             .filter((variant) => variant === 'normal' || variant === 'small-caps')
             .join('');
-        const fontFamily = fixIOSSystemFonts(styles.fontFamily).join(', ');
+        const fontFamily = styles.fontFamily.join(', ');
         const fontSize = isDimensionToken(styles.fontSize)
             ? `${styles.fontSize.number}${styles.fontSize.unit}`
             : `${styles.fontSize.number}px`;
@@ -451,6 +417,16 @@ export class TextRenderer {
             fontFamily,
             fontSize
         ];
+    }
+
+    /**
+     * -webkit-text-fill-color overrides the fill colour while leaving
+     * decorations and strokes on `color` (e.g. the classic transparent-fill
+     * gradient text). Falls back to `color` when the computed value could not
+     * be resolved (currentcolor).
+     */
+    private resolveFillColor(styles: CSSParsedDeclaration): string {
+        return asString(styles.webkitTextFillColor ?? styles.color);
     }
 
     /**
@@ -465,10 +441,10 @@ export class TextRenderer {
         baseline: number,
         containerBounds?: Bounds
     ): boolean {
-        const lineHeight = styles.fontSize.number * 1.5;
+        const lineHeight = computeLineHeight(styles.lineHeight, styles.fontSize.number);
         const lines: TextBounds[][] = [];
         let currentLine: TextBounds[] = [];
-        let currentLineTop = text.textBounds[0].bounds.top;
+        let currentLineTop = at(text.textBounds, 0).bounds.top;
 
         text.textBounds.forEach((tb) => {
             if (Math.abs(tb.bounds.top - currentLineTop) >= lineHeight * 0.5) {
@@ -486,20 +462,20 @@ export class TextRenderer {
 
         // Render full lines (0..N-2)
         for (let i = 0; i < maxLines - 1; i++) {
-            lines[i].forEach((tb) => this.renderTextBoundWithPaintOrder(tb, styles, paintOrder, baseline));
+            at(lines, i).forEach((tb) => this.renderTextBoundWithPaintOrder(tb, styles, paintOrder, baseline));
         }
 
         // Nth line: truncated with ellipsis
         const lastLine = lines[maxLines - 1];
         if (lastLine?.length && containerBounds) {
             const textStr = lastLine.map((tb) => tb.text).join('');
-            const first = lastLine[0];
+            const first = at(lastLine, 0);
             const avail = containerBounds.width - (first.bounds.left - containerBounds.left);
             const truncated = this.truncateTextWithEllipsis(textStr, avail, styles.letterSpacing);
             const bounds = new TextBounds(truncated, first.bounds);
             for (const layer of paintOrder) {
                 if (layer === PAINT_ORDER_LAYER.FILL) {
-                    this.ctx.fillStyle = asString(styles.color);
+                    this.ctx.fillStyle = this.resolveFillColor(styles);
                     this.renderTextWithLetterSpacing(bounds, styles.letterSpacing, baseline, styles.writingMode);
                 } else if (layer === PAINT_ORDER_LAYER.STROKE) {
                     this.renderTextStrokeWithStyle(bounds, styles, baseline);
@@ -520,8 +496,8 @@ export class TextRenderer {
         baseline: number,
         containerBounds: Bounds
     ): boolean {
-        const lineHeight = styles.fontSize.number * 1.5;
-        const firstTop = text.textBounds[0].bounds.top;
+        const lineHeight = computeLineHeight(styles.lineHeight, styles.fontSize.number);
+        const firstTop = at(text.textBounds, 0).bounds.top;
         const isSingleLine = text.textBounds.every((tb) => Math.abs(tb.bounds.top - firstTop) < lineHeight * 0.5);
         if (!isSingleLine) return false;
 
@@ -537,7 +513,7 @@ export class TextRenderer {
         if (fullWidth <= containerBounds.width + TEXT_OVERFLOW_EPSILON) return false;
 
         const truncated = this.truncateTextWithEllipsis(fullText, containerBounds.width, styles.letterSpacing);
-        const bounds = new TextBounds(truncated, text.textBounds[0].bounds);
+        const bounds = new TextBounds(truncated, at(text.textBounds, 0).bounds);
         for (const layer of paintOrder) {
             if (layer === PAINT_ORDER_LAYER.FILL) this.renderTextFillWithShadows(bounds, styles, baseline);
             else if (layer === PAINT_ORDER_LAYER.STROKE) this.renderTextStrokeWithStyle(bounds, styles, baseline);
@@ -545,12 +521,24 @@ export class TextRenderer {
         return true;
     }
 
+    private measureBaselineCached(fontString: string, fallback: number): number {
+        let baseline = this.baselineCache.get(fontString);
+        if (baseline === undefined) {
+            baseline = measureBaseline(this.ctx, fallback);
+            if (this.baselineCache.size >= 64) {
+                this.baselineCache.clear();
+            }
+            this.baselineCache.set(fontString, baseline);
+        }
+        return baseline;
+    }
+
     async renderTextNode(text: TextContainer, styles: CSSParsedDeclaration, containerBounds?: Bounds): Promise<void> {
         // Reset glyph width cache at the start of each text node render —
         // the font may change between nodes.
         this.glyphWidthCache = null;
         const [fontString] = this.createFontStyle(styles);
-        this.ctx.font = fontString;
+        this.ctx.font = fontString ?? '';
         this.ctx.direction = styles.direction === DIRECTION.RTL ? 'rtl' : 'ltr';
         this.ctx.textAlign = 'left';
         this.ctx.textBaseline = 'alphabetic';
@@ -560,12 +548,15 @@ export class TextRenderer {
         // This ensures correct positioning whether using webfonts (which may not
         // be loaded in the original document but are active in the Canvas) or
         // system fonts.
-        const baseline = measureBaseline(this.ctx, styles.fontSize.number);
+        const baseline = this.measureBaselineCached(fontString ?? '', styles.fontSize.number);
 
         // -webkit-line-clamp
+        // Chrome reports `display: -webkit-box` as `flow-root` in computed
+        // styles, so accept FLOW_ROOT as well as BLOCK here — otherwise the
+        // clamp branch is skipped and the text renders without truncation.
         const clamp =
             styles.webkitLineClamp > 0 &&
-            (styles.display & DISPLAY.BLOCK) !== 0 &&
+            (styles.display & (DISPLAY.BLOCK | DISPLAY.FLOW_ROOT)) !== 0 &&
             styles.overflowY === OVERFLOW.HIDDEN &&
             text.textBounds.length > 0;
         if (clamp) {
@@ -591,5 +582,100 @@ export class TextRenderer {
                 }
             });
         });
+
+        if (styles.textEmphasisStyle) {
+            this.renderTextEmphasis(text, styles, baseline);
+        }
+    }
+
+    /**
+     * Draw text-emphasis marks over (or under) each grapheme cluster.
+     *
+     * Vertical writing modes are skipped in the current scope: marks would
+     * need to sit beside vertical glyph runs rather than above them.
+     */
+    private renderTextEmphasis(text: TextContainer, styles: CSSParsedDeclaration, baseline: number): void {
+        if (isVerticalWritingMode(styles.writingMode)) {
+            return;
+        }
+        const style = styles.textEmphasisStyle;
+        if (!style) {
+            return;
+        }
+        const fontSize = styles.fontSize.number;
+        const markDiameter = fontSize * 0.5;
+        const color = asString(styles.textEmphasisColor ?? styles.color);
+        const position = styles.textEmphasisPosition;
+
+        const drawShapeMark = (centerX: number, centerY: number): void => {
+            if (typeof style === 'string') {
+                // Custom string: draw the character itself at the mark size.
+                const savedFont = this.ctx.font;
+                this.ctx.font = savedFont.replace(/^\S+/, `${markDiameter}px`);
+                this.ctx.textAlign = 'center';
+                this.ctx.fillText(style, centerX, centerY + markDiameter / 3);
+                this.ctx.font = savedFont;
+                this.ctx.textAlign = 'left';
+                return;
+            }
+            const { fill, shape } = style;
+            const radius = markDiameter * (shape === 'dot' ? 0.3 : shape === 'sesame' ? 0.26 : 0.34);
+            this.ctx.beginPath();
+            if (shape === 'sesame') {
+                // Sesame seeds are teardrop shaped; a rotated ellipse is the
+                // accepted canvas approximation.
+                this.ctx.ellipse(centerX, centerY, radius * 1.3, radius * 0.8, Math.PI / 4, 0, Math.PI * 2);
+            } else if (shape === 'triangle') {
+                this.ctx.moveTo(centerX, centerY - radius);
+                this.ctx.lineTo(centerX + radius * 1.1, centerY + radius * 0.8);
+                this.ctx.lineTo(centerX - radius * 1.1, centerY + radius * 0.8);
+                this.ctx.closePath();
+            } else {
+                this.ctx.arc(centerX, centerY, radius, 0, Math.PI * 2);
+            }
+            if (fill) {
+                if (shape === 'double-circle') {
+                    // Two concentric rings, drawn as strokes of different widths.
+                    this.ctx.lineWidth = radius * 0.7;
+                    this.ctx.stroke();
+                    this.ctx.beginPath();
+                    this.ctx.arc(centerX, centerY, radius * 0.4, 0, Math.PI * 2);
+                    this.ctx.lineWidth = radius * 0.35;
+                    this.ctx.stroke();
+                } else {
+                    this.ctx.fill();
+                }
+            } else {
+                this.ctx.lineWidth = Math.max(1, radius * 0.35);
+                this.ctx.stroke();
+                if (shape === 'double-circle') {
+                    this.ctx.beginPath();
+                    this.ctx.arc(centerX, centerY, radius * 0.5, 0, Math.PI * 2);
+                    this.ctx.stroke();
+                }
+            }
+        };
+
+        const fontString = this.ctx.font;
+        for (const tb of text.textBounds) {
+            // Walk grapheme clusters with their advance widths — the same walk
+            // the letter-spacing renderer uses — and centre a mark per glyph.
+            const baselineY = tb.bounds.top + baseline;
+            const centerY = position.over ? baselineY - fontSize - markDiameter * 0.4 : baselineY + markDiameter * 0.9;
+            let left = tb.bounds.left;
+            for (const letter of segmentGraphemes(tb.text)) {
+                const width = this.cachedMeasureText(letter, fontString);
+                this.ctx.save();
+                try {
+                    this.ctx.fillStyle = color;
+                    this.ctx.strokeStyle = color;
+                    this.ctx.lineWidth = 1;
+                    drawShapeMark(left + width / 2 + styles.letterSpacing / 2, centerY);
+                } finally {
+                    this.ctx.restore();
+                }
+                left += width + styles.letterSpacing;
+            }
+        }
     }
 }

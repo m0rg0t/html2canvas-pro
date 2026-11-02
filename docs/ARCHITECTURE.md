@@ -22,7 +22,12 @@ DOM Clone → CSS Parse → Layout → Stacking Context → Canvas Render
    reliable `getComputedStyle` results.
 
 **Slot / Shadow DOM** handling is delegated to `SlotCloner` (`slot-cloner.ts`), which
-manages `<slot>` assignment, fallback content, and shadow-root cloning.
+manages `<slot>` assignment, fallback content, and shadow-root cloning (including custom
+elements' shadow roots and attributes). When the target element lives inside a shadow root,
+the temporary iframe is created inside that shadow root so scoped styles apply.
+
+`dom-normalizer.ts` optionally normalizes the cloned DOM before capture (disables
+animations, resets transforms). Enabled by default; disable with `normalizeDom: false`.
 
 ### Phase 2: CSS Parsing (`src/css/`)
 
@@ -62,7 +67,7 @@ into a typed internal representation.
 
 #### CSSParsedDeclaration
 
-`CSSParsedDeclaration` (`css/index.ts`) is the central registry class (~86 typed fields).
+`CSSParsedDeclaration` (`css/index.ts`) is the central registry class (~105 typed fields).
 It maps CSS property names to their descriptors via a `standardProps` array and lazily
 parses each property on construction.
 
@@ -97,12 +102,31 @@ painting order:
 7. Positive z-index children
 
 Each `ElementPaint` in the tree holds an array of `IElementEffect` objects:
-- **TransformEffect** — matrix transforms with origin offset
+- **TransformEffect** — matrix transforms with origin offset (incl. the individual `rotate` property)
 - **ClipEffect** — overflow/border-radius clipping via paths
 - **OpacityEffect** — global alpha multiplication
 - **ClipPathEffect** — CSS `clip-path` shapes
 - **BlendEffect** — `mix-blend-mode` composite operations
 - **FilterEffect** — CSS `filter` functions
+
+Masked elements (`mask-image`) are also rendered as real stacking contexts and
+rasterised through the same surface path: `mask-renderer.ts` paints the mask
+layers into an alpha surface which is applied to the element surface with
+`destination-in` before compositing. `backdrop-filter` captures the region
+already painted beneath the element's border box from the main canvas, runs it
+through the filter surface pipeline, and composites it back. `background-clip:
+text` uses `text-clip-renderer.ts`: the background is painted to a device-pixel
+offscreen surface and clipped to a glyph mask built from the same text layout
+the main renderer uses, then composited 1:1 onto the main canvas.
+
+#### Filter & opacity surface compositing
+
+Eligible stacking contexts (see the [support matrix](./filter-support.md)) are rasterized
+into an intermediate surface by `filter-surface.ts` (`surface-bounds.ts` computes the
+bounded outset), the parsed filter chain (the full standard function set) is applied to
+the surface by the native canvas backend, and the layer's CSS `opacity` is composited
+once afterwards. A runtime pixel probe picks the native fast path and falls back to an
+SVG backend (blur + single drop-shadow subset) on the same surface. Unsupported chains or subtrees stay on the classic per-draw path.
 
 ### Phase 5: Canvas Rendering (`src/render/canvas/`)
 
@@ -116,8 +140,8 @@ Each `ElementPaint` in the tree holds an array of `IElementEffect` objects:
 Handles:
 - Solid background colors
 - URL-based background images (with resize + pattern creation)
-- Linear and radial gradients (rendered via offscreen canvases + `createPattern`)
-- Repeating linear gradients
+- Linear, radial and conic gradients (rendered via offscreen canvases + `createPattern`)
+- Repeating variants of all three gradient types
 - Background blend modes (via `globalCompositeOperation`)
 
 **Pattern cache**: Instance-level LRU cache (max 50) for `CanvasPattern` objects,
@@ -128,12 +152,28 @@ keyed by `URL + size + imageRendering`.
 Renders solid, dashed, dotted, and double borders per side.
 Border-image uses `border-image-renderer.ts` which implements 9-slice scaling.
 
+#### Box shadows (`box-shadow-*.ts`)
+
+Box shadows are painted by `box-shadow-painter.ts` with geometry from
+`box-shadow-geometry.ts` (blur/border-radius scaling, inset masking) and
+`box-shadow-transform.ts` (composing shadows through effective canvas transforms).
+Shadows participate in filter-surface rasterization when the layer is eligible.
+
+#### Text (`text-renderer.ts`)
+
+`text-renderer.ts` paints text runs: grapheme segmentation, letter-spacing, direction,
+writing-mode baselines (CJK stays on the alphabetic baseline), and `webkit-text-stroke`
+via `paint-order`. `font-utils.ts` measures baselines; text decoration lines
+(underline/overline/line-through with style, thickness, and offset) live in
+`text/text-decoration-renderer.ts`.
+
 #### Content (`content-renderer.ts`)
 
 Helper functions extracted from `CanvasRenderer`:
 - `renderReplacedElements` — `<img>`, `<canvas>`, `<svg>`, `<iframe>`
 - `renderFormElements` — checkboxes, radio buttons, text inputs
-- `renderListMarker` — `list-style-image` / `list-style-type` markers
+- `renderListMarker` — geometric markers for `disc` / `circle` / `square` plus
+  `list-style-image` images (contained in the 1em marker box) and `list-style-type` markers
 
 #### Effects (`effects-renderer.ts`)
 
@@ -168,13 +208,21 @@ the first key (oldest entry).
 
 | File | Lines | Purpose |
 |------|-------|---------|
-| `tokenizer.ts` | 822 | CSS tokenizer state machine |
-| `document-cloner.ts` | ~780 | DOM cloning (slot logic extracted) |
-| `canvas-renderer.ts` | ~450 | Main canvas renderer (content extracted) |
-| `color-tests.ts` | 91 tests | Color parsing tests |
-| `stacking-context.ts` | ~150 | Stacking context tree |
-| `effects.ts` | ~100 | Effect type system |
-| `border-renderer.ts` | ~200 | Border rendering |
-| `background-renderer.ts` | ~380 | Background rendering + pattern cache |
-| `slot-cloner.ts` | ~190 | Shadow DOM / Slot cloning |
-| `content-renderer.ts` | ~260 | Replaced/form/list-item rendering |
+| `canvas-renderer.ts` | ~1100 | Main canvas renderer orchestration |
+| `text-renderer.ts` | ~720 | Text run painting (CJK, writing modes, stroke) |
+| `background-renderer.ts` | ~630 | Background rendering + all gradient types + pattern cache |
+| `stacking-context.ts` | ~470 | Stacking context tree + effects |
+| `content-renderer.ts` | ~420 | Replaced/form/list-item rendering |
+| `document-cloner.ts` | ~410 | DOM cloning (slot, pseudo-element and iframe-mount logic extracted) |
+| `bound-curves.ts` | ~390 | Border-radius curves per box edge |
+| `css/index.ts` | ~350 | `CSSParsedDeclaration` registry |
+| `text-clip-renderer.ts` | ~320 | `background-clip: text` device-pixel glyph-mask surfaces |
+| `filter-surface.ts` | ~310 | Filter/opacity surface compositing |
+| `border-image-renderer.ts` | ~280 | 9-slice border-image rendering |
+| `iframe-mount.ts` | ~280 | Temporary iframe creation and mounting (incl. Shadow DOM) |
+| `effects.ts` | ~280 | Effect type system |
+| `mask-renderer.ts` | ~230 | `mask-image` alpha-surface rasterization |
+| `border-renderer.ts` | ~225 | Border rendering |
+| `box-shadow-painter.ts` | ~220 | Box shadow painting |
+| `slot-cloner.ts` | ~205 | Shadow DOM / Slot cloning |
+| `dom-normalizer.ts` | ~130 | Pre-capture DOM normalization |

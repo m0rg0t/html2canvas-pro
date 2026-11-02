@@ -78,8 +78,8 @@ export async function renderReplacedElements(
             renderReplacedElementFn(container, curves, image!);
             ctx.imageSmoothingEnabled = prevSmoothing;
         } catch (e) {
+            // Load failures are reported to onError once, by the cache.
             context.logger.error(`Error loading image ${container.src}`);
-            context.onError?.(e instanceof Error ? e : new Error(String(e)));
         }
     }
 
@@ -92,8 +92,8 @@ export async function renderReplacedElements(
             const image = await context.cache.match(container.svg);
             renderReplacedElementFn(container, curves, image!);
         } catch (e) {
+            // Load failures are reported to onError once, by the cache.
             context.logger.error(`Error loading svg ${container.svg.substring(0, 255)}`);
-            context.onError?.(e instanceof Error ? e : new Error(String(e)));
         }
     }
 
@@ -148,14 +148,14 @@ export function renderFormElements(
                 new Vector(container.bounds.left + size * 0.84, container.bounds.top + size * 0.34085),
                 new Vector(container.bounds.left + size * 0.39363, container.bounds.top + size * 0.79)
             ]);
-            ctx.fillStyle = asString(INPUT_COLOR);
+            ctx.fillStyle = asString(container.styles.accentColor ?? INPUT_COLOR);
             ctx.fill();
             ctx.restore();
         } else if (container.type === RADIO && container.checked) {
             ctx.save();
             ctx.beginPath();
             ctx.arc(container.bounds.left + size / 2, container.bounds.top + size / 2, size / 4, 0, Math.PI * 2, true);
-            ctx.fillStyle = asString(INPUT_COLOR);
+            ctx.fillStyle = asString(container.styles.accentColor ?? INPUT_COLOR);
             ctx.fill();
             ctx.restore();
         }
@@ -164,7 +164,7 @@ export function renderFormElements(
     if (isTextInputElement(container) && container.value.length) {
         const [font] = textRenderer.createFontStyle(styles);
         // Use Canvas API to measure baseline from the actual rendered font
-        ctx.font = font;
+        ctx.font = font ?? '';
         const fontSizeValue = getAbsoluteValue(styles.fontSize, 0);
         const { baseline, height: fontHeight } = measureFontMetrics(ctx, fontSizeValue);
         const isPlaceholder = container instanceof InputElementContainer && container.isPlaceholder;
@@ -308,34 +308,87 @@ export async function renderListMarker(
             const url = (img as CSSURLImage).url;
             try {
                 const image = await context.cache.match(url);
-                ctx.drawImage(image!, container.bounds.left - (image!.width + 10), container.bounds.top);
+                // Browsers contain the image inside a 1em marker box and
+                // centre it on the first line's midline — matching the
+                // geometric markers below.
+                const fontSize = getAbsoluteValue(styles.fontSize, 0);
+                const naturalWidth = (image as HTMLImageElement)?.naturalWidth || image!.width;
+                const naturalHeight = (image as HTMLImageElement)?.naturalHeight || image!.height;
+                if (naturalWidth <= 0 || naturalHeight <= 0) {
+                    return;
+                }
+                const markerScale = Math.min(fontSize / naturalWidth, fontSize / naturalHeight);
+                const markerWidth = naturalWidth * markerScale;
+                const markerHeight = naturalHeight * markerScale;
+                const markerCenterY =
+                    container.bounds.top +
+                    getAbsoluteValue(container.styles.paddingTop, container.bounds.width) +
+                    computeLineHeight(styles.lineHeight, styles.fontSize.number) / 2;
+                ctx.drawImage(
+                    image!,
+                    container.bounds.left - (markerWidth + 10),
+                    markerCenterY - markerHeight / 2,
+                    markerWidth,
+                    markerHeight
+                );
             } catch (e) {
+                // Load failures are reported to onError once, by the cache.
                 context.logger.error(`Error loading list-style-image ${url}`);
-                context.onError?.(e instanceof Error ? e : new Error(String(e)));
             }
         }
     } else if (paint.listValue && container.styles.listStyleType !== LIST_STYLE_TYPE.NONE) {
-        const [font] = textRenderer.createFontStyle(styles);
-        ctx.font = font;
-        ctx.fillStyle = asString(styles.color);
-        ctx.textBaseline = 'middle';
-        ctx.textAlign = 'right';
+        // Geometric markers (disc / circle / square) are drawn as shapes:
+        // rendering them as text glyphs relies on the font's bullet glyph,
+        // which is far smaller than the browser's marker (~0.36em circle).
+        const type = container.styles.listStyleType;
+        if (type === LIST_STYLE_TYPE.DISC || type === LIST_STYLE_TYPE.CIRCLE || type === LIST_STYLE_TYPE.SQUARE) {
+            const size = styles.fontSize.number * 0.45;
+            const cx = container.bounds.left - size * 0.9;
+            const cy =
+                container.bounds.top +
+                getAbsoluteValue(container.styles.paddingTop, container.bounds.width) +
+                computeLineHeight(styles.lineHeight, styles.fontSize.number) / 2;
+            ctx.save();
+            ctx.fillStyle = asString(styles.color);
+            ctx.beginPath();
+            if (type === LIST_STYLE_TYPE.SQUARE) {
+                ctx.rect(cx - size / 2, cy - size / 2, size, size);
+            } else {
+                ctx.arc(cx, cy, size / 2, 0, Math.PI * 2);
+                if (type === LIST_STYLE_TYPE.CIRCLE) {
+                    ctx.strokeStyle = asString(styles.color);
+                    ctx.lineWidth = size * 0.18;
+                }
+            }
+            if (type === LIST_STYLE_TYPE.CIRCLE) {
+                ctx.stroke();
+            } else {
+                ctx.fill();
+            }
+            ctx.restore();
+        } else {
+            const [font] = textRenderer.createFontStyle(styles);
+            ctx.font = font ?? '';
+            ctx.fillStyle = asString(styles.color);
+            ctx.textBaseline = 'middle';
+            ctx.textAlign = 'right';
 
-        const bounds = new Bounds(
-            container.bounds.left,
-            container.bounds.top + getAbsoluteValue(container.styles.paddingTop, container.bounds.width),
-            container.bounds.width,
-            computeLineHeight(styles.lineHeight, styles.fontSize.number) / 2 + 1
-        );
+            const bounds = new Bounds(
+                container.bounds.left,
+                container.bounds.top + getAbsoluteValue(container.styles.paddingTop, container.bounds.width),
+                container.bounds.width,
+                computeLineHeight(styles.lineHeight, styles.fontSize.number) / 2 + 1
+            );
 
-        textRenderer.renderTextWithLetterSpacing(
-            new TextBounds(paint.listValue, bounds),
-            styles.letterSpacing,
-            computeLineHeight(styles.lineHeight, styles.fontSize.number) / 2 + 2,
-            styles.writingMode
-        );
-        ctx.textBaseline = 'bottom';
-        ctx.textAlign = 'left';
+            textRenderer.renderTextWithLetterSpacing(
+                new TextBounds(paint.listValue, bounds),
+                styles.letterSpacing,
+                computeLineHeight(styles.lineHeight, styles.fontSize.number) / 2 + 2,
+                styles.writingMode
+            );
+            ctx.textBaseline = 'bottom';
+            ctx.textAlign = 'left';
+        }
     }
 }
 

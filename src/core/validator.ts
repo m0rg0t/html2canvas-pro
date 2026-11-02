@@ -12,8 +12,6 @@ export interface ValidationResult {
     valid: boolean;
     error?: string;
     sanitized?: unknown;
-    /** Indicates if runtime validation is recommended (e.g. for proxy URLs against DNS rebinding) */
-    requiresRuntimeCheck?: boolean;
 }
 
 /**
@@ -27,7 +25,8 @@ export interface ValidatorConfig {
     allowedProxyDomains?: string[];
 
     /**
-     * Allow localhost/127.0.0.1 as proxy URL. Only set for development or test (e.g. Karma reftests).
+     * Allow localhost/127.0.0.1 as proxy URL. Only set for development or test
+     * (e.g. the Playwright reftest runner, which proxies through localhost).
      * @default false
      */
     allowLocalhostProxy?: boolean;
@@ -154,13 +153,10 @@ export class Validator {
                     }
                 }
 
-                // For proxy URLs, mark that runtime validation is recommended
-                // to prevent DNS rebinding attacks
-                return {
-                    valid: true,
-                    sanitized: url,
-                    requiresRuntimeCheck: true
-                };
+                // Static hostname checks are best-effort: a proxy operator must
+                // additionally pin/resolve proxy targets server-side, since
+                // client-side validation cannot defend against DNS rebinding.
+                return { valid: true, sanitized: url };
             }
 
             return { valid: true, sanitized: url };
@@ -217,7 +213,7 @@ export class Validator {
         // Remove square brackets if present (e.g., [::1])
         const addr = normalizedHost.replace(/^\[|\]$/g, '');
         // Remove zone ID if present (e.g., fe80::1%eth0)
-        const addrWithoutZone = addr.split('%')[0];
+        const addrWithoutZone = addr.split('%')[0] ?? addr;
         // Loopback ::1 (also matches 0:0:0:0:0:0:0:1)
         if (/^(0:){7}1$/.test(addrWithoutZone) || addrWithoutZone === '::1') {
             return true;
@@ -340,6 +336,38 @@ export class Validator {
         }
 
         return { valid: true, sanitized: nonce };
+    }
+
+    /**
+     * Validate the backgroundColor option
+     *
+     * @param backgroundColor - CSS color string or null (transparent)
+     * @returns Validation result
+     */
+    validateBackgroundColor(backgroundColor: unknown): ValidationResult {
+        if (backgroundColor === null) {
+            return { valid: true, sanitized: null };
+        }
+
+        if (typeof backgroundColor !== 'string' || backgroundColor.length === 0) {
+            return {
+                valid: false,
+                error: 'backgroundColor must be a CSS color string or null'
+            };
+        }
+
+        // Anything the CSS color grammar accepts is allowed (hex, rgb(a),
+        // hsl(a), named colors, color(), oklch(), …). Only reject values no
+        // parser would accept, so an invalid string errors up front instead
+        // of silently rendering a transparent canvas.
+        if (/[^a-zA-Z0-9%(),.#\s/-]/.test(backgroundColor)) {
+            return {
+                valid: false,
+                error: `backgroundColor contains characters that cannot appear in a CSS color: ${backgroundColor}`
+            };
+        }
+
+        return { valid: true, sanitized: backgroundColor };
     }
 
     /**
@@ -511,8 +539,6 @@ export class Validator {
             if (!proxyResult.valid) {
                 errors.push(`Proxy: ${proxyResult.error}`);
             }
-            // Note: Proxy URLs are marked with requiresRuntimeCheck to prevent DNS rebinding
-            // Consider implementing runtime IP validation in production environments
         }
 
         // Validate image timeout
@@ -521,9 +547,7 @@ export class Validator {
             if (!timeoutResult.valid) {
                 errors.push(`Image timeout: ${timeoutResult.error}`);
             }
-        }
-
-        // Validate dimensions
+        } // Validate dimensions
         if (options.width !== undefined || options.height !== undefined) {
             const width = (options.width as number) ?? 800;
             const height = (options.height as number) ?? 600;
@@ -546,6 +570,14 @@ export class Validator {
             const nonceResult = this.validateCspNonce(options.cspNonce as string);
             if (!nonceResult.valid) {
                 errors.push(`CSP nonce: ${nonceResult.error}`);
+            }
+        }
+
+        // Validate background color
+        if (options.backgroundColor !== undefined) {
+            const colorResult = this.validateBackgroundColor(options.backgroundColor);
+            if (!colorResult.valid) {
+                errors.push(`backgroundColor: ${colorResult.error}`);
             }
         }
 
